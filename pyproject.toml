@@ -1,0 +1,74 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# echo-agent · Python microkernel packaging
+#
+# Local-first CLI agent. All heavy deps degrade gracefully: the codebase must
+# import and run its test suite even when optional native layers
+# (chromadb / tiktoken / discord.py) are absent.
+# ─────────────────────────────────────────────────────────────────────────────
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "echo-agent"
+version = "0.1.0"
+description = "Local-first, self-improving, event-driven polyglot AI agent"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "echo-agent contributors" }]
+keywords = ["agent", "local-first", "llm", "plugins", "memory"]
+
+dependencies = [
+    "httpx>=0.27",           # universal agent client + webhook gateways
+    "fastapi>=0.110",        # /manifest.json + /execute server
+    "uvicorn>=0.29",         # ASGI runner for the manifest server
+    "networkx>=3.2",         # episodic cause-and-effect graph
+    "numpy>=1.26",           # local vector math fallback
+    "pytest>=8.0",           # self-healing validation harness
+    # Internet access (Scrapling: TLS impersonation + anti-bot/JS rendering).
+    # Browser binaries are installed once with `uv run scrapling install`.
+    "scrapling[fetchers,rag]>=0.5",
+]
+
+[project.optional-dependencies]
+# Native / accelerated layers — install for full fidelity:
+native = [
+    "tiktoken>=0.7",         # exact token accounting for context pruning
+    "chromadb>=0.5",         # persistent local vector DB for semantic memory
+    "pybind11>=2.12",        # C++ cognitive engine bindings (build-time)
+]
+# Chat-platform gateways:
+discord = ["discord.py>=2.3"]
+# Telegram uses the core httpx dependency (plain Bot API long polling), so the
+# extra is intentionally empty and kept for backwards compatibility.
+telegram = []
+# Internet access (Scrapling: anti-bot bypass + fast HTML/Markdown extraction):
+scrapling = ["scrapling[fetchers,rag]>=0.5"]
+# Everything:
+all = ["echo-agent[native,discord,telegram,scrapling]"]
+
+# Dev tooling as a PEP 735 dependency-group: uv syncs the `dev` group by
+# default on every `uv run`/`uv sync`, so test plugins never get pruned.
+[dependency-groups]
+dev = ["pytest-asyncio>=0.23", "pytest-timeout>=2.3", "ruff>=0.4"]
+
+[project.scripts]
+echo-agent = "python_core.main:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["python_core*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+# Works with plain `pytest`, `uv run pytest`, and PYTHONPATH-less invocations:
+# src = the python_core package, "." = lets tests import `tests.conftest`.
+pythonpath = ["src", "."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

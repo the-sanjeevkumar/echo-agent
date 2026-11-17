@@ -1,0 +1,1 @@
+"""Web plugin package: internet access for the agent."""

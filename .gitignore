@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Rust
+target/
+.cargo/
+
+# CMake / C++
+cmake-build-*/
+*.so
+*.dylib
+*.dll
+
+# Local-first runtime state (never commit user data)
+.echo_agent/
+*.sqlite3*
+chroma/
+*.log
+.env

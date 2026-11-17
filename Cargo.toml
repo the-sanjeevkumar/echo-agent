@@ -1,0 +1,34 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# echo-agent · Rust High-Performance Local Event Bus ("echo-bus")
+#
+# A tokio-based actor-model IPC server speaking newline-delimited JSON-RPC 2.0
+# over a local Unix domain socket (fallback: TCP on 127.0.0.1). It carries
+# high-throughput Pub/Sub traffic between internal sub-agents
+# (Coder / Researcher / Debugger) and bridges to the Python microkernel.
+#
+# Build:  cargo build --release
+# Run:    cargo run --release -- --socket /tmp/echo-bus.sock
+# ─────────────────────────────────────────────────────────────────────────────
+[package]
+name = "echo-bus"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first, high-throughput JSON-RPC event bus for echo-agent"
+license = "MIT"
+
+[[bin]]
+name = "echo-bus"
+path = "src/rust_bus/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }        # async runtime, net, io, sync
+serde = { version = "1", features = ["derive"] }      # JSON-RPC message structs
+serde_json = "1"                                      # payload encoding
+anyhow = "1"                                          # ergonomic top-level error handling
+tracing = "0.1"                                       # structured logs
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true            # link-time optimization for the hot path
+codegen-units = 1
+panic = "abort"       # a bus crash must never corrupt state; supervisor restarts it
