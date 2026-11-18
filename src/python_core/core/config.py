@@ -115,7 +115,46 @@ class EchoConfig:
     # ── plugin discovery ───────────────────────────────────────────────────
     plugin_dirs: list[str] = field(default_factory=list)
 
+    # ── owner profile (MODULE 1 / PHASE 1) ─────────────────────────────────
+    owner_user_ids: list[str] = field(default_factory=list)  # platform ids treated as the single owner
+
     def __post_init__(self) -> None:
+        self.data_dir = Path(self.data_dir).expanduser()
+        # Keep policy values in a known set; an invalid value must fail safe
+        # (pairing for DMs, allowlist for groups) instead of silently opening up.
+        dm_choices = {"pairing", "allowlist", "open", "disabled"}
+        group_choices = {"allowlist", "open", "disabled"}
+        for field_name, default, choices in (
+            ("discord_dm_policy", "pairing", dm_choices),
+            ("telegram_dm_policy", "pairing", dm_choices),
+            ("discord_group_policy", "allowlist", group_choices),
+            ("telegram_group_policy", "allowlist", group_choices),
+        ):
+            value = str(getattr(self, field_name) or default).strip().lower()
+            setattr(self, field_name, value if value in choices else default)
+        reply_mode = str(self.gateway_reply_to_mode or "off").strip().lower()
+        self.gateway_reply_to_mode = reply_mode if reply_mode in {"off", "first", "all"} else "off"
+        for list_field in (
+            "discord_allow_from",
+            "telegram_allow_from",
+            "discord_group_allow_from",
+            "telegram_group_allow_from",
+            "discord_guilds",
+            "discord_channels",
+            "telegram_groups",
+            "owner_user_ids",
+        ):
+            value = getattr(self, list_field)
+            if isinstance(value, str):
+                setattr(
+                    self,
+                    list_field,
+                    [item.strip() for item in value.split(",") if item.strip()],
+                )
+        self.gateway_pairing_ttl = max(60.0, float(self.gateway_pairing_ttl))
+        self.gateway_pairing_max_pending = max(1, int(self.gateway_pairing_max_pending))
+        self.session_history_limit = max(2, int(self.session_history_limit))
+        self.max_sessions = max(2, int(self.max_sessions))
         self.data_dir = Path(self.data_dir).expanduser()
         # Keep policy values in a known set; an invalid value must fail safe
         # (pairing for DMs, allowlist for groups) instead of silently opening up.
@@ -248,6 +287,7 @@ class EchoConfig:
             "ECHO_MAX_CONTEXT_TOKENS": "max_context_tokens",
             "ECHO_MANIFEST_PORT": "manifest_port",
             "ECHO_USER_NAME": "user_name",
+            "ECHO_OWNER_USER_IDS": "owner_user_ids",
         }
         for env_key, field_name in env_map.items():
             if env_key in os.environ:

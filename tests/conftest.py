@@ -19,17 +19,19 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from python_core.core.config import EchoConfig  # noqa: E402
-from python_core.core.event_bus import EventBus  # noqa: E402
-from python_core.core.interfaces import KernelContext  # noqa: E402
-from python_core.core.plugin_manager import PluginManager  # noqa: E402
-from python_core.core.tool_registry import ToolRegistry  # noqa: E402
-from python_core.orchestrator import Orchestrator  # noqa: E402
-from python_core.plugins.llm.openai_compat import OpenAICompatProvider  # noqa: E402
-from python_core.plugins.memory.plugin import CognitiveMemoryPlugin  # noqa: E402
-from python_core.plugins.self_healing.plugin import SelfHealingPlugin  # noqa: E402
-from python_core.plugins.skills.ingester import SkillIngester  # noqa: E402
-from python_core.inter_agent.universal_client import UniversalClientPlugin  # noqa: E402
+from python_core.core.config import EchoConfig
+from python_core.core.event_bus import EventBus
+from python_core.core.interfaces import KernelContext
+from python_core.core.plugin_manager import PluginManager
+from python_core.core.tool_registry import ToolRegistry
+from python_core.inter_agent.universal_client import UniversalClientPlugin
+from python_core.orchestrator import Orchestrator
+from python_core.plugins.memory.plugin import (
+    EXTRACTION_SCHEMA,
+    CognitiveMemoryPlugin,
+)
+from python_core.plugins.self_healing.plugin import SelfHealingPlugin
+from python_core.plugins.skills.ingester import SkillIngester
 
 
 class FakeProvider:
@@ -37,6 +39,11 @@ class FakeProvider:
 
     Falls back to a terminal 'respond' action when the script is exhausted —
     tests never hang on an infinite tool loop.
+
+    Extraction probes (``schema`` is the profile ``EXTRACTION_SCHEMA``) return
+    an empty extraction without touching the script or the call log, so the
+    per-turn profile extraction added in Phase 1 stays invisible to existing
+    action-loop tests.
     """
 
     name = "fake_llm"
@@ -46,6 +53,8 @@ class FakeProvider:
     def __init__(self, script: list[dict[str, Any]] | None = None) -> None:
         self.script = list(script or [])
         self.calls: list[list[dict[str, str]]] = []
+        # Optional override returned for profile-extraction probes.
+        self.extraction_return: dict[str, Any] | None = None
 
     async def complete(
         self,
@@ -55,6 +64,12 @@ class FakeProvider:
         temperature: float = 0.2,
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
+        if schema is EXTRACTION_SCHEMA:
+            return {
+                "content": dict(self.extraction_return)
+                if self.extraction_return is not None
+                else {"name": None, "preferences": [], "facts": []}
+            }
         self.calls.append([dict(m) for m in messages])
         action = self.script.pop(0) if self.script else {"thought": "done", "action": "respond", "response": "ok"}
         return {"content": action}

@@ -220,6 +220,7 @@ class Orchestrator:
             reply_channel=payload.get("reply_channel"),
             platform=payload.get("platform"),
             session_id=payload.get("session_id"),
+            user_id=payload.get("user_id"),
         )
 
     # ── sessions (per DM / group / topic) ──────────────────────────────────
@@ -382,6 +383,7 @@ class Orchestrator:
         platform: str | None = None,
         on_event: ProgressCallback | None = None,
         session_id: str | None = None,
+        user_id: str | None = None,
     ) -> dict[str, Any]:
         """Execute one user task end-to-end and return a result envelope.
 
@@ -394,6 +396,10 @@ class Orchestrator:
         should be delivered back to. ``platform`` ("telegram" | "discord")
         is used as an additional routing filter so a job triggered from one
         platform is never echoed on the other.
+
+        ``user_id`` is the stable platform sender id (CLI ⇒ "owner"). It is
+        threaded through to memory so the owner profile is shared across
+        CLI/Telegram/Discord while every other sender stays isolated.
 
         ``on_event`` is an optional fire-and-forget hook for UIs (the CLI uses
         it to animate a spinner). It receives tiny dicts such as
@@ -412,6 +418,7 @@ class Orchestrator:
                 platform=platform,
                 on_event=on_event,
                 session_id=sid,
+                user_id=user_id,
             )
 
     async def _execute_task(
@@ -423,9 +430,26 @@ class Orchestrator:
         platform: str | None = None,
         on_event: ProgressCallback | None = None,
         session_id: str,
+        user_id: str | None = None,
     ) -> dict[str, Any]:
         self.bus.publish("task:received", {"text": text, "source": source}, source="orchestrator")
         started = time.monotonic()
+
+        # Profile management command (owner-only, confirmation-gated).
+        forget_parts = text.lstrip("/").strip().lower().split()
+        if forget_parts and forget_parts[0] == "forget" and len(forget_parts) <= 2:
+            result = await self._handle_forget(text, user_id=user_id, source=source, session_id=session_id)
+            self._finish(
+                text,
+                result,
+                reply_channel,
+                platform,
+                elapsed=time.monotonic() - started,
+                cached=False,
+                session_id=session_id,
+                user_id=user_id,
+            )
+            return result
 
         # 1. Semantic cache (MODULE 4), scoped to this chat session.
         tool_names = [s["name"] for s in self.tools.schemas()]
@@ -442,11 +466,15 @@ class Orchestrator:
                 elapsed=time.monotonic() - started,
                 cached=True,
                 session_id=session_id,
+                user_id=user_id,
+                source=source,
             )
             return result
 
         # 2. Context assembly + bounded ReAct loop.
-        messages = await self._build_messages(text, session_id=session_id)
+        messages = await self._build_messages(
+            text, session_id=session_id, user_id=user_id, source=source
+        )
         steps: list[dict[str, Any]] = []
         response: str | None = None
         invalid_streak = 0
@@ -547,8 +575,72 @@ class Orchestrator:
             elapsed=(time.monotonic() - started),
             cached=False,
             session_id=session_id,
+            user_id=user_id,
+            source=source,
         )
         return result
+
+    # ── profile management (/forget, owner-only, confirmation-gated) ───────
+    async def _handle_forget(
+        self,
+        text: str,
+        *,
+        user_id: str | None,
+        source: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """``/forget`` wipes the sender's durable profile.
+
+        First send ``/forget`` to arm a confirmation (TTL from
+        ``ProfileStore``), then ``/forget confirm`` to actually wipe. Only the
+        owner profile may be managed this way; isolated non-owner profiles are
+        out of scope here. Memory failures never break the loop.
+        """
+        memory = self.memory
+        if memory is None or not hasattr(memory, "clear_profile"):
+            return {
+                "response": "⚠ profile storage is unavailable right now.",
+                "steps": [],
+                "cached": False,
+                "session_id": session_id,
+            }
+        try:
+            parts = text.strip().lower().split()
+            confirmed = len(parts) == 2 and parts[1] == "confirm"
+            outcome = memory.clear_profile(user_id or "", source=source, confirmed=confirmed)
+        except Exception:  # noqa: BLE001
+            logger.exception("profile clear failed")
+            return {
+                "response": "⚠ couldn't process the profile clear request.",
+                "steps": [],
+                "cached": False,
+                "session_id": session_id,
+            }
+        if not outcome.get("ok"):
+            return {
+                "response": f"⚠ {outcome.get('error', 'profile clear failed')}.",
+                "steps": [],
+                "cached": False,
+                "session_id": session_id,
+            }
+        if outcome.get("pending"):
+            ttl = int(outcome.get("ttl_seconds", 0) or 0)
+            return {
+                "response": (
+                    "⚠ This will wipe your saved profile (name, preferences, "
+                    f"pinned facts) for user {outcome.get('user_id')}. "
+                    f"Send /forget confirm within {ttl // 60} minutes to proceed."
+                ),
+                "steps": [],
+                "cached": False,
+                "session_id": session_id,
+            }
+        return {
+            "response": f"🗑 Your profile ({outcome.get('user_id')}) has been wiped. I'll call you by name again once you tell me.",
+            "steps": [],
+            "cached": False,
+            "session_id": session_id,
+        }
 
     @staticmethod
     def _notify(on_event: ProgressCallback | None, event: dict[str, Any]) -> None:
@@ -570,6 +662,8 @@ class Orchestrator:
         elapsed: float,
         cached: bool,
         session_id: str = "main",
+        user_id: str | None = None,
+        source: str | None = None,
     ) -> None:
         self.bus.publish(
             "task:completed",
@@ -580,6 +674,8 @@ class Orchestrator:
                 "reply_channel": reply_channel,
                 "platform": platform,
                 "session_id": session_id,
+                "user_id": user_id,
+                "source": source,
             },
             source="orchestrator",
         )
@@ -646,10 +742,13 @@ class Orchestrator:
         }
 
     # ── context assembly & pruning (MODULE 4) ──────────────────────────────
-    async def _build_messages(self, text: str, *, session_id: str = "main") -> list[dict[str, str]]:
+    async def _build_messages(
+        self, text: str, *, session_id: str = "main", user_id: str | None = None, source: str | None = None
+    ) -> list[dict[str, str]]:
         tools = json.dumps(self.tools.schemas(), separators=(",", ":"))
         # Working Memory (volatile) + Semantic recall (durable), if present.
         wm_block, recall_block = "", ""
+        profile_block = ""
         mem = self.memory
         if mem is not None:
             try:
@@ -663,13 +762,17 @@ class Orchestrator:
                         + "\n".join(f"- {r.get('text', '')[:200]}" for r in recalled)
                         + "\n"
                     )
+                # IDENTITY IN EVERY PROFILE: the USER PROFILE block comes from
+                # the durable ProfileStore and is injected into EVERY prompt.
+                # session:reset and restarts never touch it.
+                profile_block = mem.profile_block(user_id or "", source=source)
             except Exception:  # noqa: BLE001
                 logger.exception("memory recall failed; continuing without it")
         system = SYSTEM_TEMPLATE.format(
             tools=tools,
             memory_block=recall_block,
             working_memory=wm_block,
-            user_profile=self._user_profile_block(),
+            user_profile=profile_block,
         )
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
@@ -683,19 +786,6 @@ class Orchestrator:
             messages.extend(kept)
         messages.append({"role": "user", "content": text})
         return (await self.prune(messages))[0]
-
-    def _user_profile_block(self) -> str:
-        """Build a USER PROFILE block from learned name + preferences."""
-        config = self.config
-        lines: list[str] = []
-        if config.user_name:
-            lines.append(f"- The user's name is {config.user_name}. Address them by name when natural.")
-        if config.user_preferences:
-            for k, v in config.user_preferences.items():
-                lines.append(f"- User preference: {k} = {v}")
-        if not lines:
-            return ""
-        return "USER PROFILE (learned from conversation):\n" + "\n".join(lines) + "\n"
 
     async def prune(self, messages: list[dict[str, str]]) -> tuple[list[dict[str, str]], str]:
         """Hard token ceiling; dropped turns collapse into ONE summary block."""

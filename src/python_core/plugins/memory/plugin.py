@@ -2,12 +2,14 @@
 
 Responsibilities:
     * expose the stores behind the ``MemoryPlugin`` Protocol (services['memory'])
+    * own the durable owner profile (ProfileStore): <data_dir>/profiles/owner.json
+      plus one isolated profile per non-owner sender
     * dogfood dynamic tool registration via ``tool:register`` bus events
       (memory_recall / memory_remember / memory_stats / memory_trace)
     * auto-record experiences: every ``tool:executed`` and ``task:completed``
       event becomes an episodic memory row + cause-effect graph edge
     * own the background ConsolidationLoop lifecycle
-    * auto-extract personal facts (name, preferences) from conversations
+    * auto-extract personal facts (name, preferences, facts) from conversations
 """
 
 from __future__ import annotations
@@ -22,21 +24,56 @@ from python_core.core.event_bus import EventBus, Subscription
 from python_core.core.interfaces import KernelContext, ToolSpec
 
 from .consolidator import ConsolidationLoop
+from .profile import _NAME_STOPWORDS, ProfileStore
 from .storage import EpisodicMemory, SemanticMemory, WorkingMemory
 
 logger = logging.getLogger("echo.memory")
 
-# ── personal-fact extraction patterns ──────────────────────────────────────
+# ── fast-path name / preference regexes (zero LLM cost) ────────────────────
 _NAME_PATTERNS = [
-    re.compile(r"\bmy name is\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)", re.IGNORECASE),
-    re.compile(r"\bi['’]m\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)", re.IGNORECASE),
-    re.compile(r"\bcall me\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)", re.IGNORECASE),
-    re.compile(r"\bi am\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)", re.IGNORECASE),
+    re.compile(r"\bmy name is\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)", re.IGNORECASE),
+    re.compile(r"\bi['’]m\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)", re.IGNORECASE),
+    re.compile(r"\bcall me\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)", re.IGNORECASE),
+    re.compile(r"\bi am\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)", re.IGNORECASE),
+    re.compile(r"\bmyself\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)", re.IGNORECASE),
+    re.compile(r"\bthis is\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)", re.IGNORECASE),
+    re.compile(r"\b([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\s+here\b", re.IGNORECASE),
 ]
+_BARE_NAME = re.compile(r"^[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?$")
 _PREF_PATTERNS = [
     re.compile(r"\bi\s+(prefer|like|love|don.?t like|dislike|hate)\s+(.+)", re.IGNORECASE),
     re.compile(r"\bmy\s+(.+?)\s+is\s+(.+)", re.IGNORECASE),
 ]
+_EPHEMERA_KEYS = {"question", "query", "task", "request", "issue", "problem", "error", "answer", "name"}
+
+# Structured schema for the per-turn profile extraction call (temperature 0).
+EXTRACTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "name": {
+            "type": ["string", "null"],
+            "description": "the user's name, only when explicitly stated",
+        },
+        "preferences": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "key": {"type": "string", "description": "preference key, snake_case"},
+                    "value": {"type": "string"},
+                },
+                "required": ["key", "value"],
+            },
+        },
+        "facts": {
+            "type": "array",
+            "items": {"type": "string", "description": "durable identity fact"},
+        },
+    },
+    "required": ["name", "preferences", "facts"],
+}
 
 
 class CognitiveMemoryPlugin:
@@ -53,10 +90,14 @@ class CognitiveMemoryPlugin:
         self.wm = WorkingMemory(capacity=self.config.wm_capacity)
         self.em: EpisodicMemory | None = None
         self.sm: SemanticMemory | None = None
+        self.profiles: ProfileStore | None = None
         self.consolidator: ConsolidationLoop | None = None
         self._ctx: KernelContext | None = None
         self._bus: EventBus | None = None
         self._subs: list[Subscription] = []
+        # assistant's most recent response per session, so a bare-name reply
+        # ("Sanjeev") can be matched to the turn that asked for the name.
+        self._last_assistant: dict[str, str] = {}
 
     # ── plugin lifecycle ───────────────────────────────────────────────────
     async def start(self, ctx: KernelContext) -> None:
@@ -65,12 +106,26 @@ class CognitiveMemoryPlugin:
         self.config = ctx.config  # adopt the kernel's live config
         self.em = EpisodicMemory(ctx.config.sqlite_path)
         self.sm = SemanticMemory(ctx.config.vector_dir)
+        # Durable owner profile: loaded at plugin start, atomic writes.
+        self.profiles = ProfileStore(
+            ctx.config.data_dir, owner_user_ids=list(ctx.config.owner_user_ids)
+        )
+        ctx.services["memory"] = self
+        ctx.services["profile_store"] = self.profiles
+
         self.consolidator = ConsolidationLoop(
             ctx.bus, self.wm, self.em, self.sm,
             idle_seconds=ctx.config.consolidation_idle_seconds,
             services_getter=lambda: ctx.services,
         )
-        ctx.services["memory"] = self
+
+        # Auto-episodicity: observe the system and remember what happened.
+        self._subs.append(
+            ctx.bus.subscribe("tool:executed", self._on_tool_executed, label="memory.tool_executed")
+        )
+        self._subs.append(
+            ctx.bus.subscribe("task:completed", self._on_task_completed, label="memory.task_completed")
+        )
 
         # Auto-episodicity: observe the system and remember what happened.
         self._subs.append(
@@ -198,52 +253,192 @@ class CognitiveMemoryPlugin:
             metadata={"elapsed_ms": payload.get("elapsed_ms")},
         )
 
-    def _on_task_completed(self, event: Any) -> None:
+    async def _on_task_completed(self, event: Any) -> None:
         payload = getattr(event, "payload", event) or {}
         response = str(payload.get("response", ""))[:400]
         if response:
             salience = 0.8 if not payload.get("cached") else 0.5
             self.wm.push(f"task: {str(payload.get('task', ''))[:160]} → {response[:160]}", role="agent", salience=salience)
 
-        # Auto-extract personal facts from the user's task text.
+        # Auto-extract personal facts from the user's turn and durably update
+        # the sender's profile (owner profile for the owner, isolated profile
+        # for anyone else). Failures here never reach the user.
         task_text = str(payload.get("task", ""))
-        if task_text and self._ctx is not None:
-            self._extract_personal_facts(task_text)
+        user_id = str(payload.get("user_id") or "")
+        source = str(payload.get("source") or "")
+        session_id = str(payload.get("session_id") or "main")
+        assistant_text = self._last_assistant.get(session_id, "")
+        if task_text and self.profiles is not None:
+            try:
+                await self._update_profile_from_turn(user_id, source, task_text, assistant_text)
+            except Exception:  # memory extraction never breaks the loop
+                logger.exception("profile extraction failed")
+        # Remember this turn's response so the NEXT user turn can rescue a bare name.
+        self._last_assistant[session_id] = response
 
-    def _extract_personal_facts(self, text: str) -> None:
-        """Scan *text* for personal facts (name, preferences) and store them
-        durably in config + semantic memory so the agent remembers them."""
-        if self._ctx is None or self.config is None:
+    async def _update_profile_from_turn(
+        self, user_id: str, source: str, task_text: str, assistant_text: str
+    ) -> None:
+        """One bounded structured LLM call (primary) plus zero-cost regex
+        fast-path; last-write-wins merge into ProfileStore."""
+        key = self.profiles.resolve_key(user_id, source)
+
+        # 1. Fast-path regexes (no LLM cost).
+        delta: dict[str, Any] = self._extract_fast(task_text, assistant_text)
+
+        # 2. Primary: one structured LLM call per user turn.
+        llm = self._ctx.services.get("llm") if self._ctx is not None else None
+        if llm is not None:
+            try:
+                out = await llm.complete(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Extract durable profile facts about the user from their latest message. "
+                                "Return ONLY JSON matching the schema: {\"name\": string|null, "
+                                "\"preferences\": [{\"key\": string, \"value\": string}], \"facts\": [string]}. "
+                                "Rules: set name only when the user states their name explicitly (including a "
+                                "bare name when the previous assistant turn asked for it); preferences are "
+                                "durable likes/dislikes only — never ephemera such as \"my question is ...\"; "
+                                "facts are other stable identity facts. Omit unknown fields."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Previous assistant message: {assistant_text[:400]}\n"
+                                f"User message: {task_text[:800]}"
+                            ),
+                        },
+                    ],
+                    schema=EXTRACTION_SCHEMA,
+                    temperature=0.0,
+                    max_tokens=250,
+                )
+                content = out.get("content") if isinstance(out, dict) else None
+                if isinstance(content, dict):
+                    llm_name = content.get("name")
+                    llm_prefs = content.get("preferences") or []
+                    llm_facts = content.get("facts") or []
+                    llm_delta: dict[str, Any] = {}
+                    if isinstance(llm_name, str) and llm_name.strip():
+                        llm_delta["name"] = llm_name.strip()
+                    if isinstance(llm_prefs, list):
+                        prefs = {}
+                        for item in llm_prefs:
+                            if isinstance(item, dict) and isinstance(item.get("key"), str) and isinstance(item.get("value"), str):
+                                prefs[item["key"].strip()] = item["value"].strip()
+                        if prefs:
+                            llm_delta["preferences"] = prefs
+                    if isinstance(llm_facts, list):
+                        llm_delta["facts"] = [str(f) for f in llm_facts if str(f).strip()]
+                    # Fast path has final say on what it explicitly found.
+                    delta = {**llm_delta, **delta}
+            except Exception:  # noqa: BLE001 — regex fallback keeps working offline
+                logger.debug("LLM profile extraction unavailable; using fast path only")
+
+        if not delta:
             return
-        config = self._ctx.config
 
-        # --- name extraction ---
-        if not config.user_name:
-            for pattern in _NAME_PATTERNS:
-                m = pattern.search(text)
-                if m:
-                    name = m.group(1).strip()
-                    config.user_name = name
-                    self._remember_fact(f"User's name is {name}", salience=0.9)
-                    config.save_user_profile()
-                    logger.info("memory: learned user name = %s", name)
-                    break
+        profile = self.profiles.update(
+            key,
+            name=delta.get("name"),
+            preferences=delta.get("preferences") or None,
+            facts=delta.get("facts") or None,
+        )
+        # Mirror into config so legacy readers (config.user_name / config.toml)
+        # stay in sync with the durable profile store.
+        config = self._ctx.config if self._ctx is not None else self.config
+        if config is not None:
+            config.user_name = profile.name
+            config.user_preferences = dict(profile.preferences)
+            try:
+                config.save_user_profile()
+            except Exception:  # config.toml mirror is best-effort
+                logger.debug("config.toml profile mirror write failed", exc_info=True)
+        logger.info(
+            "memory: profile updated for %s (name=%s)", key, profile.name or "(none)"
+        )
 
-        # --- preference extraction ---
+    @staticmethod
+    def _extract_fast(task_text: str, assistant_text: str) -> dict[str, Any]:
+        """Zero-LLM fact capture: extended name patterns + bare-name rescue
+        when the assistant just asked for the name."""
+        delta: dict[str, Any] = {}
+        asked_for_name = bool(re.search(r"\bname\b|\bcall you\b", assistant_text or "", re.IGNORECASE))
+
+        for pattern in _NAME_PATTERNS:
+            m = pattern.search(task_text)
+            if m:
+                delta["name"] = m.group(1).strip().title()
+                break
+
+        # Bare-name rescue: "Sanjeev" alone, right after we asked for the name.
+        if "name" not in delta and asked_for_name:
+            m = _BARE_NAME.match(task_text.strip())
+            if m and m.group(0).lower() not in _NAME_STOPWORDS:
+                delta["name"] = m.group(0).strip().title()
+
+        # Preferences (skip ephemera).
         for pattern in _PREF_PATTERNS:
-            for m in pattern.finditer(text):
-                if m.lastindex >= 2:
-                    key = m.group(1).strip().lower()
-                    value = m.group(2).strip()
-                    # Skip generic matches
-                    if len(value) < 2 or len(value) > 200:
-                        continue
-                    pref_key = key.replace(" ", "_")
-                    config.user_preferences[pref_key] = value
-                    self._remember_fact(f"User preference: {key} = {value}", salience=0.7)
-                    logger.info("memory: learned preference %s = %s", key, value)
-        if config.user_preferences:
-            config.save_user_profile()
+            for m in pattern.finditer(task_text):
+                if m.lastindex < 2:
+                    continue
+                key = m.group(1).strip().lower()
+                value = m.group(2).strip()
+                if len(value) < 2 or len(value) > 200:
+                    continue
+                pref_key = key.replace(" ", "_")
+                if pref_key in _EPHEMERA_KEYS:
+                    continue
+                # "my <question/task/...> is ..." is not a preference.
+                if any(ephem in pref_key for ephem in ("question", "query", "task", "error", "issue")):
+                    continue
+                delta.setdefault("preferences", {})[pref_key] = value
+
+        return delta
+
+    # ── public profile API (used by the orchestrator and the CLI) ──────────
+    def profile_block(self, user_id: str, source: str | None = None) -> str:
+        """USER PROFILE block for *user_id*, always safe to inject into a
+        system prompt (<=500 tokens after trimming)."""
+        if self.profiles is None:
+            return ""
+        key = self.profiles.resolve_key(user_id, source)
+        return self.profiles.block(key, budget_tokens=500)
+
+    def update_profile(
+        self,
+        user_id: str,
+        source: str | None = None,
+        *,
+        name: str | None = None,
+        preferences: dict[str, str] | None = None,
+        facts: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Explicit profile update (tools/CLI). Last-write-wins."""
+        if self.profiles is None:
+            return {"ok": False, "error": "profile store unavailable"}
+        key = self.profiles.resolve_key(user_id, source)
+        profile = self.profiles.update(
+            key, name=name, preferences=preferences, facts=facts
+        )
+        return {"ok": True, "user_id": key, "name": profile.name, "is_owner": self.profiles.is_owner(key)}
+
+    def clear_profile(self, user_id: str, source: str | None = None, confirmed: bool = False) -> dict[str, Any]:
+        if self.profiles is None:
+            return {"ok": False, "error": "profile store unavailable"}
+        key = self.profiles.resolve_key(user_id, source)
+        if not self.profiles.is_owner(key):
+            return {"ok": False, "error": "profile management is owner-only"}
+        if not confirmed:
+            self.profiles.request_clear(key)
+            return {"ok": True, "pending": True, "ttl_seconds": self.profiles.confirm_ttl}
+        ok = self.profiles.clear(key, confirmed=True)
+        return {"ok": ok}
+
+    # ── tool handlers ──────────────────────────────────────────────────────
 
     # ── tool handlers ──────────────────────────────────────────────────────
     def _tool_recall(self, args: dict[str, Any]) -> dict[str, Any]:

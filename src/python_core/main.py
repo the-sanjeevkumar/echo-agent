@@ -290,7 +290,9 @@ async def _cmd_run(task_text: str, config: EchoConfig, *, as_json: bool = False)
             spinner = Spinner("thinking")
             await spinner.start()
             try:
-                result = await orchestrator.handle_task(task_text, source="cli", on_event=spinner.on_event)
+                result = await orchestrator.handle_task(
+                    task_text, source="cli", user_id="owner", on_event=spinner.on_event
+                )
             finally:
                 await spinner.stop()
             render_response(result.get("response", ""))
@@ -299,7 +301,7 @@ async def _cmd_run(task_text: str, config: EchoConfig, *, as_json: bool = False)
                 print(paint("  (cached)", "2"))
             return 0 if result.get("response") is not None else 1
 
-        result = await orchestrator.handle_task(task_text, source="cli")
+        result = await orchestrator.handle_task(task_text, source="cli", user_id="owner")
         print(json.dumps(
             {
                 "response": result.get("response", ""),
@@ -392,7 +394,7 @@ async def _repl(orchestrator: Orchestrator, stop: asyncio.Event) -> None:
         spinner = Spinner("thinking")
         await spinner.start()
         try:
-            result = await orchestrator.handle_task(line, source="repl", on_event=spinner.on_event)
+            result = await orchestrator.handle_task(line, source="repl", user_id="owner", on_event=spinner.on_event)
         finally:
             await spinner.stop()
 
@@ -444,6 +446,39 @@ def _cmd_plugins(config: EchoConfig) -> int:
     for p in builtins:
         print(f"- {p['name']:22s} {', '.join(p['capabilities'])}")
     return 0
+
+
+def _cmd_profile(args: argparse.Namespace, config: EchoConfig) -> int:
+    """Inspect or wipe the owner profile (name, preferences, pinned facts)."""
+
+    async def _run() -> int:
+        ctx, pm, _orchestrator = await build_kernel(config, include_gateways=False)
+        try:
+            memory = ctx.service("memory")
+            if memory is None or not hasattr(memory, "profile_block"):
+                print("memory plugin unavailable", file=sys.stderr)
+                return 1
+            if args.profile_command == "show":
+                block = memory.profile_block("owner", source="cli")
+                print(block if block else "(no profile yet — tell me your name!)")
+                return 0
+            if args.profile_command == "forget":
+                if not getattr(args, "confirm", False):
+                    print(
+                        "refusing to wipe without --confirm. Run: echo-agent profile forget --confirm",
+                        file=sys.stderr,
+                    )
+                    return 1
+                outcome = memory.clear_profile("owner", source="cli", confirmed=True)
+                print(
+                    f"🗑 owner profile wiped" if outcome.get("ok") else f"⚠ {outcome.get('error', 'failed')}"
+                )
+                return 0 if outcome.get("ok") else 1
+        finally:
+            await pm.stop_all()
+        return 0
+
+    return asyncio.run(_run())
 
 
 def _pairing_store(config: EchoConfig) -> PairingStore:
@@ -983,6 +1018,12 @@ def cli(argv: list[str] | None = None) -> int:
     sub.add_parser("tools", help="list registered tools")
     sub.add_parser("plugins", help="list built-in plugins")
 
+    profile_p = sub.add_parser("profile", help="show or wipe the owner profile")
+    profile_sub = profile_p.add_subparsers(dest="profile_command", required=True)
+    profile_sub.add_parser("show", help="show the owner profile block injected into prompts")
+    profile_forget = profile_sub.add_parser("forget", help="wipe the owner profile (confirmation-gated)")
+    profile_forget.add_argument("--confirm", action="store_true", help="really wipe the profile")
+
     sub.add_parser("status", help="show whether the background daemon is running")
     sub.add_parser("stop", help="stop the background daemon")
     sub.add_parser("restart", help="restart the background daemon")
@@ -1105,6 +1146,8 @@ def cli(argv: list[str] | None = None) -> int:
         return _cmd_tools(config)
     if args.command == "plugins":
         return _cmd_plugins(config)
+    if args.command == "profile":
+        return _cmd_profile(args, config)
     if args.command == "pairing":
         return _cmd_pairing(args, config)
     if args.command == "gateway":
