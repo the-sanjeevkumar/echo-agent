@@ -74,7 +74,12 @@ SYSTEM_TEMPLATE = (
     "Strategy: use tools for anything factual or mutating; prefer unified diffs over "
     "full files; keep 'thought' to one sentence.\n"
     "AVAILABLE TOOLS (JSON schema):\n{tools}\n"
-    "{memory_block}RECENT CONTEXT:\n{working_memory}"
+    "{user_profile}{memory_block}RECENT CONTEXT:\n{working_memory}"
+    "\n\nMEMORY GUIDANCE:\n"
+    "- Use memory_remember to store important facts about the user (name, preferences, goals).\n"
+    "- Use memory_recall to recall the user's name, preferences, and past context before answering.\n"
+    "- Adapt your responses to the user's known preferences and name.\n"
+    "- If you do not know the user's name, ask \"What should I call you?\" and remember it with memory_remember.\n"
 )
 
 
@@ -660,7 +665,12 @@ class Orchestrator:
                     )
             except Exception:  # noqa: BLE001
                 logger.exception("memory recall failed; continuing without it")
-        system = SYSTEM_TEMPLATE.format(tools=tools, memory_block=recall_block, working_memory=wm_block)
+        system = SYSTEM_TEMPLATE.format(
+            tools=tools,
+            memory_block=recall_block,
+            working_memory=wm_block,
+            user_profile=self._user_profile_block(),
+        )
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         # Fold prior conversation for *this* session, pruned to budget.
@@ -673,6 +683,19 @@ class Orchestrator:
             messages.extend(kept)
         messages.append({"role": "user", "content": text})
         return (await self.prune(messages))[0]
+
+    def _user_profile_block(self) -> str:
+        """Build a USER PROFILE block from learned name + preferences."""
+        config = self.config
+        lines: list[str] = []
+        if config.user_name:
+            lines.append(f"- The user's name is {config.user_name}. Address them by name when natural.")
+        if config.user_preferences:
+            for k, v in config.user_preferences.items():
+                lines.append(f"- User preference: {k} = {v}")
+        if not lines:
+            return ""
+        return "USER PROFILE (learned from conversation):\n" + "\n".join(lines) + "\n"
 
     async def prune(self, messages: list[dict[str, str]]) -> tuple[list[dict[str, str]], str]:
         """Hard token ceiling; dropped turns collapse into ONE summary block."""

@@ -100,6 +100,16 @@ class TelegramGateway(GatewayInterface):
 
         self.bind_bus(ctx.bus)
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(65.0, connect=15.0))
+        # Discover available models from the LLM provider.
+        llm = ctx.service("llm")
+        if llm is not None:
+            try:
+                models = await llm.list_models()
+                if models:
+                    self.config.available_models = models
+                    ctx.logger.info("telegram: discovered %d models", len(models))
+            except Exception:  # noqa: BLE001
+                ctx.logger.debug("telegram: model discovery failed", exc_info=True)
         self._running = True
         self._task = asyncio.create_task(self._run(), name="echo-telegram")
         self.start_notification_pump()
@@ -400,14 +410,29 @@ class TelegramGateway(GatewayInterface):
                 )
                 return
             if command == "model":
-                if not args:
-                    await self.send_reply(
-                        chat_id,
-                        f"current model: {getattr(self.config, 'llm_model', '?')}\n"
-                        f"usage: /model <new-model-name>",
-                    )
+                if not args or args.strip().lower() == "list":
+                    models = list(self.config.available_models) if self.config.available_models else []
+                    current = getattr(self.config, "llm_model", "?")
+                    if models:
+                        model_list = "\n".join(f"• {m}" + ("  ← current" if m == current else "") for m in models)
+                        await self.send_reply(
+                            chat_id,
+                            f"Available models:\n{model_list}\n\nusage: /model <model-name>",
+                        )
+                    else:
+                        await self.send_reply(
+                            chat_id,
+                            f"current model: {current}\n"
+                            f"Could not discover models from the LLM server.\n"
+                            f"usage: /model <model-name>",
+                        )
                     return
-                self.config.llm_model = args.strip()
+                name = args.strip()
+                self.config.llm_model = name
+                try:
+                    self.config.save_llm_model(name)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("telegram: failed to persist model %s: %s", name, exc)
                 await self.send_reply(
                     chat_id,
                     f"✅ model changed to: {self.config.llm_model}\n"

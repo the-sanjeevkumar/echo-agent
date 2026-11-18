@@ -185,6 +185,25 @@ class OpenAICompatProvider:
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         return {"content": extract_json(content if isinstance(content, str) else ""), "raw": content, "usage": data.get("usage", {})}
 
+    # ── model discovery ────────────────────────────────────────────────────
+    async def list_models(self) -> list[str]:
+        """Query the LLM server's /v1/models endpoint and return model IDs."""
+        base = self.config.llm_base_url.rstrip("/")
+        headers = {"Content-Type": "application/json"}
+        if self.config.llm_api_key:
+            headers["Authorization"] = f"Bearer {self.config.llm_api_key}"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(f"{base}/models", headers=headers)
+            if resp.status_code >= 400:
+                return []
+            data = resp.json()
+            models = [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+            return sorted(set(models))
+        except Exception:  # noqa: BLE001 — discovery is best-effort
+            logger.debug("model discovery failed", exc_info=True)
+            return []
+
 
 def create_plugin() -> OpenAICompatProvider:
     """Plugin discovery contract entry point (uses loaded EchoConfig)."""

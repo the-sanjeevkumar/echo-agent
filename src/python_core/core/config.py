@@ -33,6 +33,11 @@ class EchoConfig:
     llm_api_key: str = ""                              # optional for local servers
     llm_timeout: float = 120.0
     llm_retries: int = 3                               # bounded retries on 429/5xx
+    available_models: list[str] = field(default_factory=list)  # discovered models from /v1/models
+
+    # ── user profile (memory) ──────────────────────────────────────────────
+    user_name: str = ""                                      # learned from conversation
+    user_preferences: dict[str, str] = field(default_factory=dict)  # key → value preferences
 
     # ── token efficiency (MODULE 4) ────────────────────────────────────────
     max_context_tokens: int = 8192     # hard budget for the prompt window
@@ -207,7 +212,16 @@ class EchoConfig:
                 raw = tomllib.load(fh)
             for section, fields in raw.items():
                 if isinstance(fields, dict):
-                    if section in ("llm", "web", "discord", "telegram", "gateway", "session"):
+                    if section == "user":
+                        if "name" in fields:
+                            values["user_name"] = fields["name"]
+                        for k, v in fields.items():
+                            if k.startswith("pref__"):
+                                pref_key = k[len("pref__"):]
+                                prefs = values.setdefault("user_preferences", {})
+                                if isinstance(prefs, dict):
+                                    prefs[pref_key] = v
+                    elif section in ("llm", "web", "discord", "telegram", "gateway", "session"):
                         # [llm] base_url → llm_base_url; [web] max_chars →
                         # web_max_chars; [discord] dm_policy → discord_dm_policy
                         # (fully-qualified keys are still accepted).
@@ -233,6 +247,7 @@ class EchoConfig:
             "ECHO_TELEGRAM_TOKEN": "telegram_token",
             "ECHO_MAX_CONTEXT_TOKENS": "max_context_tokens",
             "ECHO_MANIFEST_PORT": "manifest_port",
+            "ECHO_USER_NAME": "user_name",
         }
         for env_key, field_name in env_map.items():
             if env_key in os.environ:
@@ -249,8 +264,80 @@ class EchoConfig:
             "timeout": "llm_timeout",
             "idle_seconds": "consolidation_idle_seconds",
             "session_max_sessions": "max_sessions",
+            "llm_available_models": "available_models",
         }
         values = {alias.get(k, k): v for k, v in values.items()}
 
         known = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in values.items() if k in known})
+
+    # ── config.toml persistence helpers ────────────────────────────────────
+    def _config_path(self) -> Path:
+        return Path(os.environ.get("ECHO_DATA_DIR", _default_data_dir())) / "config.toml"
+
+    def _read_toml_text(self) -> str:
+        path = self._config_path()
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    def _write_toml_text(self, text: str) -> None:
+        path = self._config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def _upsert_toml_key(self, section: str, key: str, value: str) -> None:
+        """Insert or replace `key = value` under `[section]` in config.toml."""
+        text = self._read_toml_text()
+        line = f'{key} = {value!r}'
+        # Find the section header
+        section_header = f"[{section}]"
+        if section_header in text:
+            # Replace within that section
+            lines = text.split("\n")
+            out = []
+            in_section = False
+            replaced = False
+            for ln in lines:
+                stripped = ln.strip()
+                if stripped == section_header:
+                    in_section = True
+                    out.append(ln)
+                    continue
+                if in_section and stripped.startswith("["):
+                    in_section = False
+                if in_section and stripped.startswith(f"{key} ="):
+                    out.append(line)
+                    replaced = True
+                    continue
+                out.append(ln)
+            if in_section and not replaced:
+                # Section found but key not present; insert after section header
+                for i, ln in enumerate(out):
+                    if ln.strip() == section_header:
+                        out.insert(i + 1, line)
+                        break
+            text = "\n".join(out)
+        else:
+            # Section doesn't exist; append it
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += f"\n{section_header}\n{line}\n"
+        self._write_toml_text(text)
+
+    def save_user_profile(self) -> None:
+        """Persist user_name and user_preferences to config.toml."""
+        if self.user_name:
+            self._upsert_toml_key("user", "name", self.user_name)
+        for k, v in self.user_preferences.items():
+            self._upsert_toml_key("user", f"pref__{k}", v)
+
+    def save_llm_model(self, model_name: str) -> None:
+        """Persist the chosen LLM model to config.toml."""
+        self._upsert_toml_key("llm", "model", model_name)
+        self.llm_model = model_name
+
+    def save_available_models(self, models: list[str]) -> None:
+        """Persist discovered model list to config.toml."""
+        self._upsert_toml_key("llm", "available_models", models)
+        self.available_models = models

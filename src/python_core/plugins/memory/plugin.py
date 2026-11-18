@@ -7,12 +7,14 @@ Responsibilities:
     * auto-record experiences: every ``tool:executed`` and ``task:completed``
       event becomes an episodic memory row + cause-effect graph edge
     * own the background ConsolidationLoop lifecycle
+    * auto-extract personal facts (name, preferences) from conversations
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from python_core.core.config import EchoConfig
@@ -23,6 +25,18 @@ from .consolidator import ConsolidationLoop
 from .storage import EpisodicMemory, SemanticMemory, WorkingMemory
 
 logger = logging.getLogger("echo.memory")
+
+# ── personal-fact extraction patterns ──────────────────────────────────────
+_NAME_PATTERNS = [
+    re.compile(r"\bmy name is\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)", re.IGNORECASE),
+    re.compile(r"\bi['’]m\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)", re.IGNORECASE),
+    re.compile(r"\bcall me\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)", re.IGNORECASE),
+    re.compile(r"\bi am\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)", re.IGNORECASE),
+]
+_PREF_PATTERNS = [
+    re.compile(r"\bi\s+(prefer|like|love|don.?t like|dislike|hate)\s+(.+)", re.IGNORECASE),
+    re.compile(r"\bmy\s+(.+?)\s+is\s+(.+)", re.IGNORECASE),
+]
 
 
 class CognitiveMemoryPlugin:
@@ -190,6 +204,46 @@ class CognitiveMemoryPlugin:
         if response:
             salience = 0.8 if not payload.get("cached") else 0.5
             self.wm.push(f"task: {str(payload.get('task', ''))[:160]} → {response[:160]}", role="agent", salience=salience)
+
+        # Auto-extract personal facts from the user's task text.
+        task_text = str(payload.get("task", ""))
+        if task_text and self._ctx is not None:
+            self._extract_personal_facts(task_text)
+
+    def _extract_personal_facts(self, text: str) -> None:
+        """Scan *text* for personal facts (name, preferences) and store them
+        durably in config + semantic memory so the agent remembers them."""
+        if self._ctx is None or self.config is None:
+            return
+        config = self._ctx.config
+
+        # --- name extraction ---
+        if not config.user_name:
+            for pattern in _NAME_PATTERNS:
+                m = pattern.search(text)
+                if m:
+                    name = m.group(1).strip()
+                    config.user_name = name
+                    self._remember_fact(f"User's name is {name}", salience=0.9)
+                    config.save_user_profile()
+                    logger.info("memory: learned user name = %s", name)
+                    break
+
+        # --- preference extraction ---
+        for pattern in _PREF_PATTERNS:
+            for m in pattern.finditer(text):
+                if m.lastindex >= 2:
+                    key = m.group(1).strip().lower()
+                    value = m.group(2).strip()
+                    # Skip generic matches
+                    if len(value) < 2 or len(value) > 200:
+                        continue
+                    pref_key = key.replace(" ", "_")
+                    config.user_preferences[pref_key] = value
+                    self._remember_fact(f"User preference: {key} = {value}", salience=0.7)
+                    logger.info("memory: learned preference %s = %s", key, value)
+        if config.user_preferences:
+            config.save_user_profile()
 
     # ── tool handlers ──────────────────────────────────────────────────────
     def _tool_recall(self, args: dict[str, Any]) -> dict[str, Any]:
