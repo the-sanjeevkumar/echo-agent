@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -27,7 +28,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from python_core.core.utils import cosine, hash_embedding
+from python_core.core.utils import cosine
+
+from .embeddings import EmbeddingEngine
 
 logger = logging.getLogger("echo.memory")
 
@@ -134,6 +137,38 @@ class EpisodicMemory:
             )
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_ts ON episodes(ts)")
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_action ON episodes(action)")
+            # PHASE 3: full-text search over episodes and a durable session
+            # archive. FTS5 is local, free (no LLM cost) and survives restarts.
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts         REAL    NOT NULL,
+                    session_id TEXT    NOT NULL,
+                    role       TEXT    NOT NULL,
+                    content    TEXT    NOT NULL,
+                    user_id    TEXT
+                )
+                """
+            )
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_sid ON sessions(session_id)")
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5("
+                "action, outcome, content='episodes', content_rowid='id')"
+            )
+            self._conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS episodes_ai AFTER INSERT ON episodes BEGIN "
+                "INSERT INTO episodes_fts(rowid, action, outcome) "
+                "VALUES (new.id, new.action, new.outcome); END"
+            )
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5("
+                "content, content='sessions', content_rowid='id')"
+            )
+            self._conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN "
+                "INSERT INTO sessions_fts(rowid, content) VALUES (new.id, new.content); END"
+            )
             self._conn.commit()
 
     def _rebuild_graph(self) -> None:
@@ -179,6 +214,87 @@ class EpisodicMemory:
                 {"id": row[0], "ts": row[1], "action": row[2], "outcome": row[3], "success": bool(row[4]), "salience": row[5], "metadata": json.loads(row[6] or "{}")}
             )
         return out
+
+    # ── PHASE 3: FTS + session archive ────────────────────────────────────
+    @staticmethod
+    def _fts_query(query: str) -> str:
+        """Turn a user query into a safe FTS5 OR expression (no injection)."""
+        terms = re.findall(r"\w+", query or "")
+        if not terms:
+            return ""
+        return " OR ".join(f'"{term}"' for term in terms[:40])
+
+    def archive_session(self, session_id: str, messages: list[dict[str, str]], *, user_id: str | None = None) -> int:
+        """Archive messages BEFORE a session reset clears live history."""
+        stored = 0
+        with self._lock:
+            for message in messages or []:
+                role = str(message.get("role", "") or "")
+                content = str(message.get("content", "") or "")
+                if role not in {"user", "assistant"} or not content.strip():
+                    continue
+                self._conn.execute(
+                    "INSERT INTO sessions (ts, session_id, role, content, user_id) VALUES (?,?,?,?,?)",
+                    (time.time(), session_id[:200], role, content[:8000], user_id or ""),
+                )
+                stored += 1
+            if stored:
+                self._conn.commit()
+        return stored
+
+    def search_sessions(
+        self, query: str, *, session_id: str | None = None, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Return real past messages matching *query* (zero LLM cost)."""
+        expression = self._fts_query(query)
+        if not expression:
+            return []
+        sql = (
+            "SELECT s.session_id, s.role, s.content, s.ts, bm25(sessions_fts) AS rank "
+            "FROM sessions_fts f JOIN sessions s ON s.id = f.rowid "
+            "WHERE sessions_fts MATCH ?"
+        )
+        params: list[Any] = [expression]
+        if session_id:
+            sql += " AND s.session_id = ?"
+            params.append(session_id)
+        sql += " ORDER BY rank LIMIT ?"
+        params.append(max(1, min(int(limit), 50)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [
+            {
+                "session_id": row[0],
+                "role": row[1],
+                "text": row[2],
+                "ts": row[3],
+                "score": round(-float(row[4]), 4),
+                "kind": "session",
+            }
+            for row in rows
+        ]
+
+    def search_episodes(self, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        """FTS over episode action/outcome (scoped search, no noise)."""
+        expression = self._fts_query(query)
+        if not expression:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT e.id, e.action, e.outcome, e.success, bm25(episodes_fts) AS rank "
+                "FROM episodes_fts f JOIN episodes e ON e.id = f.rowid "
+                "WHERE episodes_fts MATCH ? ORDER BY rank LIMIT ?",
+                (expression, max(1, min(int(limit), 50))),
+            ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "text": f"experience: {row[1]} → {str(row[2])[:160]} ({'ok' if row[3] else 'fail'})",
+                "score": round(-float(row[4]), 4),
+                "kind": "episode",
+            }
+            for row in rows
+        ]
 
     def trace_back(self, outcome_substring: str, *, max_depth: int = 3) -> list[str]:
         """BFS predecessors in the cause-effect graph — 'what led to this?'."""
@@ -236,11 +352,18 @@ class SemanticMemory:
     (e.g. all-MiniLM) without touching any other layer.
     """
 
-    def __init__(self, vector_dir: Path) -> None:
+    def __init__(self, vector_dir: Path, config: Any | None = None) -> None:
         self.dir = vector_dir
         self.dir.mkdir(parents=True, exist_ok=True)
         self._docs_path = self.dir / "docs.jsonl"
         self._docs: dict[str, dict[str, Any]] = {}
+        # PHASE 3: real ONNX embeddings when available; hash offline fallback.
+        self.engine = EmbeddingEngine(
+            getattr(config, "data_dir", vector_dir.parent) if config else vector_dir.parent,
+            backend=getattr(config, "embeddings_backend", "auto"),
+            model_dir=getattr(config, "embedding_model_dir", ""),
+            enabled=getattr(config, "enable_embeddings", True),
+        )
         self._load_docs()
         self._backend_name, self._backend = self._pick_backend()
         self._hydrate_backend()
@@ -293,11 +416,19 @@ class SemanticMemory:
         tmp.replace(self._docs_path)  # atomic swap
 
     # ── public API ─────────────────────────────────────────────────────────
+    def embed(self, text: str) -> list[float]:
+        """Embed text behind one stable interface: ONNX MiniLM when the
+        runtime + model are installed, deterministic hash otherwise."""
+        return self.engine.embed(text)
+
     @staticmethod
-    def embed(text: str) -> list[float]:
-        """Local, deterministic embedding. Replace with a local ONNX encoder
-        for production-grade recall; the interface stays identical."""
-        return hash_embedding(text)
+    def _lexical_score(query: str, text: str) -> float:
+        """FTS-style lexical overlap score (local, zero cost) for hybrid rank."""
+        terms = set(re.findall(r"\w+", (query or "").lower()))
+        if not terms:
+            return 0.0
+        tokens = set(re.findall(r"\w+", (text or "").lower()))
+        return len(terms & tokens) / len(terms)
 
     def upsert(self, doc_id: str, text: str, metadata: dict[str, Any] | None = None, *, salience: float = 0.5) -> None:
         doc = {"id": doc_id, "text": text, "metadata": {**(metadata or {}), "salience": salience}}
@@ -324,18 +455,35 @@ class SemanticMemory:
         else:
             hits = self._backend.query(emb, k)
         out = []
-        for doc_id, score in hits[:k]:
+        for doc_id, score in hits[: max(k * 3, k)]:
             doc = self._docs.get(doc_id)
             if doc is None or score < min_score:
                 continue
-            out.append({"id": doc_id, "text": doc["text"], "metadata": doc["metadata"], "score": round(float(score), 4)})
-        return out
+            vector_score = float(score)
+            lexical = self._lexical_score(query, doc["text"])
+            # Hybrid: vector similarity is primary, lexical FTS signal adds a
+            # local boost for exact terms (NEVER an LLM call).
+            hybrid = 0.75 * min(1.0, vector_score) + 0.25 * lexical
+            out.append({
+                "id": doc_id,
+                "text": doc["text"],
+                "metadata": doc["metadata"],
+                "score": round(hybrid, 4),
+                "vector_score": round(vector_score, 4),
+                "lexical_score": round(lexical, 4),
+            })
+        out.sort(key=lambda hit: hit["score"], reverse=True)
+        return out[:k]
 
     def count(self) -> int:
         return len(self._docs)
 
     def stats(self) -> dict[str, Any]:
-        return {"backend": self._backend_name, "documents": self.count()}
+        return {
+            "backend": self._backend_name,
+            "documents": self.count(),
+            "embeddings": self.engine.stats(),
+        }
 
 
 class _NumpyIndex:

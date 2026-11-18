@@ -121,6 +121,11 @@ class EchoConfig:
     # ── curated memory (MODULE 2 / PHASE 2) ────────────────────────────────
     memory_write_approval: bool = False  # gate `memory` tool writes behind /memory approve
 
+    # ── embeddings (PHASE 3) ───────────────────────────────────────────────
+    embeddings_backend: str = "auto"   # auto = ONNX MiniLM if installed, else hash
+    embedding_model_dir: str = ""      # default: <data_dir>/models/all-MiniLM-L6-v2
+    enable_embeddings: bool = True     # off = hash-only deterministic fallback
+
     def __post_init__(self) -> None:
         self.data_dir = Path(self.data_dir).expanduser()
         # Keep policy values in a known set; an invalid value must fail safe
@@ -291,6 +296,9 @@ class EchoConfig:
             "ECHO_MANIFEST_PORT": "manifest_port",
             "ECHO_USER_NAME": "user_name",
             "ECHO_OWNER_USER_IDS": "owner_user_ids",
+            "ECHO_EMBEDDINGS_BACKEND": "embeddings_backend",
+            "ECHO_EMBEDDING_MODEL_DIR": "embedding_model_dir",
+            "ECHO_ENABLE_EMBEDDINGS": "enable_embeddings",
         }
         for env_key, field_name in env_map.items():
             if env_key in os.environ:
@@ -303,7 +311,10 @@ class EchoConfig:
                 )
 
         # 3. Env booleans (env_map leaves strings; cast them explicitly).
-        for env_key, field_name in (("ECHO_MEMORY_WRITE_APPROVAL", "memory_write_approval"),):
+        for env_key, field_name in (
+            ("ECHO_MEMORY_WRITE_APPROVAL", "memory_write_approval"),
+            ("ECHO_ENABLE_EMBEDDINGS", "enable_embeddings"),
+        ):
             if env_key in os.environ:
                 values[field_name] = os.environ[env_key].strip().lower() in {"1", "true", "yes", "on"}
 

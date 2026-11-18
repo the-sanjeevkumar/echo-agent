@@ -208,7 +208,7 @@ class ConsolidationLoop:
 
         # (a) Cluster near-duplicate WM items → recurring themes.
         texts = [getattr(i, "text", str(i)) for i in wm_items]
-        embs = [SemanticMemory.embed(t) for t in texts]
+        embs = [self.sm.embed(t) for t in texts]
         used = [False] * len(texts)
         for i in range(len(texts)):
             if used[i]:

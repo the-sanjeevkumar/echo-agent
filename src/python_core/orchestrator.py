@@ -125,6 +125,7 @@ class CacheEntry:
     embedding: list[float]
     response: dict[str, Any]
     ts: float
+    scope: str = ""
 
 
 class SemanticCache:
@@ -153,7 +154,7 @@ class SemanticCache:
         emb = hash_embedding(prompt)
         best, best_sim = None, self._config.cache_similarity_threshold
         for e in self._entries.values():
-            if not e.key.endswith("‖scope:" + scope):
+            if e.scope != scope:
                 continue
             sim = cosine(emb, e.embedding)
             if sim >= best_sim:
@@ -168,12 +169,26 @@ class SemanticCache:
             return
         key = self._exact_key(prompt, tool_names, scope)
         self._entries[key] = CacheEntry(
-            key=key, prompt=prompt, embedding=hash_embedding(prompt), response=response, ts=time.time()
+            key=key, prompt=prompt, embedding=hash_embedding(prompt), response=response,
+            ts=time.time(), scope=scope,
         )
         self._order.append(key)
         if len(self._order) > 256:  # bounded memory footprint
             old = self._order.pop(0)
             self._entries.pop(old, None)
+
+    def evict_scope(self, scope: str) -> int:
+        """Drop EVERY cache entry belonging to one session (Phase 3 / S4).
+
+        Without this, a /reset could immediately replay a cached answer from
+        the very conversation the user just cleared.
+        """
+        keys = [key for key, entry in self._entries.items() if entry.scope == scope]
+        for key in keys:
+            self._entries.pop(key, None)
+            if key in self._order:
+                self._order.remove(key)
+        return len(keys)
 
 
 # ── the orchestrator itself (satisfies the Plugin Protocol) ─────────────────
@@ -356,14 +371,31 @@ class Orchestrator:
         payload = event.payload if hasattr(event, "payload") else event
         sid = self._normalize_session((payload or {}).get("session_id"))
         async with self._lock_for(sid):
+            history = list(
+                self.conversation if sid == "main" else self._sessions.get(sid, [])
+            )
+            # Phase 3: archive the conversation BEFORE clearing it so
+            # session_search can find pre-reset messages (S4).
+            archived = 0
+            mem = self.memory
+            if mem is not None and history:
+                try:
+                    archived = mem.archive_session(
+                        sid, [dict(m) for m in history], user_id=str((payload or {}).get("user_id") or "")
+                    )
+                except Exception:  # archiving is best-effort; reset still completes
+                    logger.exception("failed to archive session %s before reset", sid)
             if sid == "main":
                 self.conversation = []
                 self._sessions["main"] = self.conversation
             else:
                 self._sessions.pop(sid, None)
             self._save_sessions()
-        logger.info("session reset: %s", sid)
-        return {"session_id": sid, "reset": True}
+        # Evict this session's semantic-cache entries: a cached answer from
+        # the cleared conversation must never be replayed (S4).
+        evicted = self.cache.evict_scope(sid)
+        logger.info("session reset: %s (archived=%d, cache_evicted=%d)", sid, archived, evicted)
+        return {"session_id": sid, "reset": True, "archived": archived, "cache_evicted": evicted}
 
     async def _on_session_status(self, event: Any) -> dict[str, Any]:
         payload = event.payload if hasattr(event, "payload") else event

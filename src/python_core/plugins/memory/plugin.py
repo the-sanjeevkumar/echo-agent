@@ -107,7 +107,7 @@ class CognitiveMemoryPlugin:
         self._bus = ctx.bus
         self.config = ctx.config  # adopt the kernel's live config
         self.em = EpisodicMemory(ctx.config.sqlite_path)
-        self.sm = SemanticMemory(ctx.config.vector_dir)
+        self.sm = SemanticMemory(ctx.config.vector_dir, config=ctx.config)
         # Durable owner profile: loaded at plugin start, atomic writes.
         self.profiles = ProfileStore(
             ctx.config.data_dir, owner_user_ids=list(ctx.config.owner_user_ids)
@@ -149,6 +149,28 @@ class CognitiveMemoryPlugin:
                 tags=["memory"],
             ),
             "handler": self._tool_recall,
+        })
+        await ctx.bus.emit("tool:register", {
+            "spec": ToolSpec(
+                name="session_search",
+                description=(
+                    "Search REAL past messages from archived sessions with "
+                    "SQLite FTS5 (no LLM cost). Use this after /reset or when "
+                    "you need an exact earlier message."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "session_id": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                    },
+                    "required": ["query"],
+                },
+                source="plugin:memory",
+                tags=["memory", "search"],
+            ),
+            "handler": self._tool_session_search,
         })
         await ctx.bus.emit("tool:register", {
             "spec": ToolSpec(
@@ -233,20 +255,33 @@ class CognitiveMemoryPlugin:
             return {"patterns": 0}
         return await self.consolidator.consolidate()
 
-    def recall(self, query: str, *, k: int = 5) -> list[dict]:
-        """Hybrid recall: semantic hits first, then recent episodic context."""
+    def recall(self, query: str, *, k: int = 5, session_id: str | None = None) -> list[dict]:
+        """Scoped hybrid recall: semantic hits + FTS matches only.
+
+        Phase 3 removed the unconditional "last 3 episodes" noise: episodes
+        appear only when the query actually matches them via FTS5.
+        """
         results: list[dict] = []
         if self.sm is not None:
             for hit in self.sm.recall(query, k=k):
-                results.append({"text": hit["text"], "score": hit["score"], "kind": hit["metadata"].get("kind", "fact")})
-        if self.em is not None:
-            for ep in self.em.recent(limit=3):
                 results.append({
-                    "text": f"experience: {ep['action']} → {ep['outcome'][:120]} ({'ok' if ep['success'] else 'fail'})",
-                    "score": 0.3,
-                    "kind": "episode",
+                    "text": hit["text"],
+                    "score": hit["score"],
+                    "kind": hit["metadata"].get("kind", "fact"),
                 })
+        if self.em is not None:
+            results.extend(self.em.search_episodes(query, limit=k))
         return results
+
+    def archive_session(self, session_id: str, messages: list[dict[str, str]], *, user_id: str | None = None) -> int:
+        """Archive a session's messages before reset (durable FTS store)."""
+        return self.em.archive_session(session_id, messages, user_id=user_id) if self.em else 0
+
+    def session_search(
+        self, query: str, *, session_id: str | None = None, limit: int = 10
+    ) -> list[dict]:
+        """Search real past messages from archived sessions (zero LLM cost)."""
+        return self.em.search_sessions(query, session_id=session_id, limit=limit) if self.em else []
 
     def trace_back(self, outcome: str) -> list[str]:
         return self.em.trace_back(outcome) if self.em else []
@@ -465,8 +500,20 @@ class CognitiveMemoryPlugin:
 
     # ── tool handlers ──────────────────────────────────────────────────────
     def _tool_recall(self, args: dict[str, Any]) -> dict[str, Any]:
-        hits = self.recall(str(args.get("query", "")), k=int(args.get("k", 5)))
+        hits = self.recall(
+            str(args.get("query", "")),
+            k=int(args.get("k", 5)),
+            session_id=args.get("session_id"),
+        )
         return {"hits": hits}
+
+    def _tool_session_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        hits = self.session_search(
+            str(args.get("query", "")),
+            session_id=args.get("session_id"),
+            limit=int(args.get("limit", 10)),
+        )
+        return {"hits": hits, "ok": True}
 
     def _tool_memory(self, args: dict[str, Any]) -> dict[str, Any]:
         """Curated-memory write tool: target + add/patch/remove operations."""
