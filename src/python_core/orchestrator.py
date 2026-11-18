@@ -74,12 +74,21 @@ SYSTEM_TEMPLATE = (
     "Strategy: use tools for anything factual or mutating; prefer unified diffs over "
     "full files; keep 'thought' to one sentence.\n"
     "AVAILABLE TOOLS (JSON schema):\n{tools}\n"
-    "{user_profile}{memory_block}RECENT CONTEXT:\n{working_memory}"
+    "{user_profile}{memory_snapshot}{memory_block}RECENT CONTEXT:\n{working_memory}"
     "\n\nMEMORY GUIDANCE:\n"
-    "- Use memory_remember to store important facts about the user (name, preferences, goals).\n"
-    "- Use memory_recall to recall the user's name, preferences, and past context before answering.\n"
-    "- Adapt your responses to the user's known preferences and name.\n"
-    "- If you do not know the user's name, ask \"What should I call you?\" and remember it with memory_remember.\n"
+    "- The USER PROFILE and curated MEMORY snapshot above are injected into every "
+    "prompt: use them. Identity survives /reset and restarts.\n"
+    "- Proactively save with the `memory` tool: target='user' for the owner's name, "
+    "preferences and corrections; target='memory' for server/environment facts, "
+    "conventions, lessons, completed work and supervision findings.\n"
+    "- A fact is remembered ONLY when the `memory` tool call reports ok — NEVER claim "
+    "you saved something in plain text. Prefer patching an existing entry over "
+    "duplicating it; remove stale entries.\n"
+    "- If the tool reports a capacity error, consolidate into ONE consolidating batch "
+    "(patch/remove stale entries, then re-add) — never silently drop facts.\n"
+    "- Use memory_recall to search past experience when the snapshot is not enough.\n"
+    "- If you do not know the user's name, ask \"What should I call you?\"; the profile "
+    "store captures the answer automatically.\n"
 )
 
 
@@ -748,7 +757,7 @@ class Orchestrator:
         tools = json.dumps(self.tools.schemas(), separators=(",", ":"))
         # Working Memory (volatile) + Semantic recall (durable), if present.
         wm_block, recall_block = "", ""
-        profile_block = ""
+        profile_block, curated_block = "", ""
         mem = self.memory
         if mem is not None:
             try:
@@ -766,6 +775,10 @@ class Orchestrator:
                 # the durable ProfileStore and is injected into EVERY prompt.
                 # session:reset and restarts never touch it.
                 profile_block = mem.profile_block(user_id or "", source=source)
+                # Curated USER.md / MEMORY.md snapshot (frozen, with usage headers).
+                curated = getattr(self, "_ctx", None) and self._ctx.service("curated_memory")
+                if curated is not None:
+                    curated_block = curated.snapshot()
             except Exception:  # noqa: BLE001
                 logger.exception("memory recall failed; continuing without it")
         system = SYSTEM_TEMPLATE.format(
@@ -773,6 +786,7 @@ class Orchestrator:
             memory_block=recall_block,
             working_memory=wm_block,
             user_profile=profile_block,
+            memory_snapshot=curated_block,
         )
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]

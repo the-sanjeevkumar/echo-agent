@@ -24,6 +24,7 @@ from python_core.core.event_bus import EventBus, Subscription
 from python_core.core.interfaces import KernelContext, ToolSpec
 
 from .consolidator import ConsolidationLoop
+from .curated import CuratedMemoryStore
 from .profile import _NAME_STOPWORDS, ProfileStore
 from .storage import EpisodicMemory, SemanticMemory, WorkingMemory
 
@@ -91,6 +92,7 @@ class CognitiveMemoryPlugin:
         self.em: EpisodicMemory | None = None
         self.sm: SemanticMemory | None = None
         self.profiles: ProfileStore | None = None
+        self.curated: CuratedMemoryStore | None = None
         self.consolidator: ConsolidationLoop | None = None
         self._ctx: KernelContext | None = None
         self._bus: EventBus | None = None
@@ -110,21 +112,18 @@ class CognitiveMemoryPlugin:
         self.profiles = ProfileStore(
             ctx.config.data_dir, owner_user_ids=list(ctx.config.owner_user_ids)
         )
+        # Curated long-term stores (USER.md / MEMORY.md).
+        self.curated = CuratedMemoryStore(
+            ctx.config.memory_dir, write_approval=ctx.config.memory_write_approval
+        )
         ctx.services["memory"] = self
         ctx.services["profile_store"] = self.profiles
+        ctx.services["curated_memory"] = self.curated
 
         self.consolidator = ConsolidationLoop(
             ctx.bus, self.wm, self.em, self.sm,
             idle_seconds=ctx.config.consolidation_idle_seconds,
             services_getter=lambda: ctx.services,
-        )
-
-        # Auto-episodicity: observe the system and remember what happened.
-        self._subs.append(
-            ctx.bus.subscribe("tool:executed", self._on_tool_executed, label="memory.tool_executed")
-        )
-        self._subs.append(
-            ctx.bus.subscribe("task:completed", self._on_task_completed, label="memory.task_completed")
         )
 
         # Auto-episodicity: observe the system and remember what happened.
@@ -153,17 +152,43 @@ class CognitiveMemoryPlugin:
         })
         await ctx.bus.emit("tool:register", {
             "spec": ToolSpec(
-                name="memory_remember",
-                description="Store a durable fact/skill into semantic memory with a salience score.",
+                name="memory",
+                description=(
+                    "Curated long-term memory. target='user' writes to "
+                    "USER.md (the owner's identity: name, preferences, "
+                    "pinned facts); target='memory' writes to MEMORY.md "
+                    "(agent notes: server facts, conventions, lessons, "
+                    "completed work). Each operation is {action, content, "
+                    "old_text?}; action in {add, patch, remove}. Adds are "
+                    "rejected if they are exact duplicates; patch/remove use "
+                    "unique-substring matching; capacity overflow returns an "
+                    "error instead of silently dropping content."
+                ),
                 parameters={
                     "type": "object",
-                    "properties": {"text": {"type": "string"}, "salience": {"type": "number"}},
-                    "required": ["text"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "target": {"type": "string", "enum": ["user", "memory"]},
+                        "operations": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "action": {"type": "string", "enum": ["add", "patch", "remove"]},
+                                    "content": {"type": "string"},
+                                    "old_text": {"type": "string"},
+                                },
+                                "required": ["action", "content"],
+                            },
+                        },
+                    },
+                    "required": ["target", "operations"],
                 },
                 source="plugin:memory",
                 tags=["memory"],
             ),
-            "handler": self._tool_remember,
+            "handler": self._tool_memory,
         })
         await ctx.bus.emit("tool:register", {
             "spec": ToolSpec(
@@ -439,26 +464,39 @@ class CognitiveMemoryPlugin:
         return {"ok": ok}
 
     # ── tool handlers ──────────────────────────────────────────────────────
-
-    # ── tool handlers ──────────────────────────────────────────────────────
     def _tool_recall(self, args: dict[str, Any]) -> dict[str, Any]:
         hits = self.recall(str(args.get("query", "")), k=int(args.get("k", 5)))
         return {"hits": hits}
 
-    def _tool_remember(self, args: dict[str, Any]) -> dict[str, Any]:
-        if self.sm is None:
-            return {"ok": False, "error": "semantic memory unavailable"}
-        import uuid
-
-        text = str(args.get("text", "")).strip()
-        if not text:
-            return {"ok": False, "error": "empty text"}
-        doc_id = f"fact:{uuid.uuid4().hex[:12]}"
-        self.sm.upsert(doc_id, text, metadata={"origin": "tool"}, salience=float(args.get("salience", 0.7)))
-        return {"ok": True, "id": doc_id}
+    def _tool_memory(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Curated-memory write tool: target + add/patch/remove operations."""
+        return self.curated_apply(args.get("target"), args.get("operations", []))
 
     def _tool_stats(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.stats()
+        stats = self.stats()
+        if self.curated is not None:
+            stats["curated"] = self.curated.stats()
+        return stats
+
+    # ── curated-memory public API (tool + CLI) ────────────────────────────
+    def curated_apply(self, target: Any, operations: Any) -> dict[str, Any]:
+        if self.curated is None:
+            return {"ok": False, "error": "curated memory unavailable"}
+        if not isinstance(operations, list) or not operations:
+            return {"ok": False, "error": "operations must be a non-empty array"}
+        return self.curated.apply(str(target), operations)
+
+    def curated_snapshot(self) -> str:
+        return self.curated.snapshot() if self.curated is not None else ""
+
+    def curated_pending(self) -> list[dict[str, Any]]:
+        return self.curated.pending_list() if self.curated is not None else []
+
+    def curated_approve(self, pend_id: str) -> dict[str, Any]:
+        return self.curated.approve(pend_id) if self.curated is not None else {"ok": False, "error": "unavailable"}
+
+    def curated_reject(self, pend_id: str) -> dict[str, Any]:
+        return self.curated.reject(pend_id) if self.curated is not None else {"ok": False, "error": "unavailable"}
 
 
 def create_plugin() -> CognitiveMemoryPlugin:

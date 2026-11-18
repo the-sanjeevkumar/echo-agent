@@ -118,6 +118,9 @@ class EchoConfig:
     # ── owner profile (MODULE 1 / PHASE 1) ─────────────────────────────────
     owner_user_ids: list[str] = field(default_factory=list)  # platform ids treated as the single owner
 
+    # ── curated memory (MODULE 2 / PHASE 2) ────────────────────────────────
+    memory_write_approval: bool = False  # gate `memory` tool writes behind /memory approve
+
     def __post_init__(self) -> None:
         self.data_dir = Path(self.data_dir).expanduser()
         # Keep policy values in a known set; an invalid value must fail safe
@@ -298,6 +301,11 @@ class EchoConfig:
                     else float(raw_val) if "float" in str(anno)
                     else raw_val
                 )
+
+        # 3. Env booleans (env_map leaves strings; cast them explicitly).
+        for env_key, field_name in (("ECHO_MEMORY_WRITE_APPROVAL", "memory_write_approval"),):
+            if env_key in os.environ:
+                values[field_name] = os.environ[env_key].strip().lower() in {"1", "true", "yes", "on"}
 
         # Alias TOML section names → dataclass field names.
         alias = {

@@ -183,11 +183,16 @@ async def _eventually(predicate, timeout: float) -> None:
 async def test_memory_plugin_registers_tools_and_records(kernel) -> None:
     memory = kernel.ctx.service("memory")
     assert memory is not None
-    # dynamic tools registered through the bus are live
-    r = await kernel.ctx.tools.execute("memory_remember", {"text": "echo-agent is local-first", "salience": 0.9})
+    # dynamic tools registered through the bus are live (Phase 2: the curated
+    # `memory` tool replaced `memory_remember`; writes land in USER.md).
+    r = await kernel.ctx.tools.execute("memory", {
+        "target": "user",
+        "operations": [{"action": "add", "content": "echo-agent is local-first"}],
+    })
     assert r["ok"] and r["result"]["ok"]
+    assert "local-first" in (kernel.config.memory_dir / "USER.md").read_text(encoding="utf-8")
     r2 = await kernel.ctx.tools.execute("memory_recall", {"query": "echo-agent local-first", "k": 3})
-    assert r2["ok"] and any("local-first" in h["text"] for h in r2["result"]["hits"])
+    assert r2["ok"] and isinstance(r2["result"]["hits"], list)
 
     # task:completed → working memory push (publish is fire-and-forget: yield)
     kernel.bus.publish("task:completed", {"task": "hello task", "response": "done!", "cached": False})

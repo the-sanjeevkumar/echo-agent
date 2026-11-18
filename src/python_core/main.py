@@ -481,6 +481,40 @@ def _cmd_profile(args: argparse.Namespace, config: EchoConfig) -> int:
     return asyncio.run(_run())
 
 
+def _cmd_memory(args: argparse.Namespace, config: EchoConfig) -> int:
+    """Manage the write-approval gate for curated memory (/memory …)."""
+
+    async def _run() -> int:
+        ctx, pm, _orchestrator = await build_kernel(config, include_gateways=False)
+        try:
+            memory = ctx.service("memory")
+            if memory is None or not hasattr(memory, "curated_pending"):
+                print("memory plugin unavailable", file=sys.stderr)
+                return 1
+            action = args.memory_command
+            if action == "pending":
+                items = memory.curated_pending()
+                if not items:
+                    print("no pending memory writes")
+                    return 0
+                for item in items:
+                    print(json.dumps(item, indent=2, ensure_ascii=False))
+                return 0
+            if action == "approve":
+                outcome = memory.curated_approve(args.id)
+                print(f"✅ approved {args.id}" if outcome.get("ok") else f"⚠ {outcome.get('error', 'failed')}")
+                return 0 if outcome.get("ok") else 1
+            if action == "reject":
+                outcome = memory.curated_reject(args.id)
+                print(f"🗑 rejected {args.id}" if outcome.get("ok") else f"⚠ {outcome.get('error', 'failed')}")
+                return 0 if outcome.get("ok") else 1
+        finally:
+            await pm.stop_all()
+        return 0
+
+    return asyncio.run(_run())
+
+
 def _pairing_store(config: EchoConfig) -> PairingStore:
     return PairingStore(
         config.data_dir / "gateways" / "pairing.json",
@@ -1024,6 +1058,14 @@ def cli(argv: list[str] | None = None) -> int:
     profile_forget = profile_sub.add_parser("forget", help="wipe the owner profile (confirmation-gated)")
     profile_forget.add_argument("--confirm", action="store_true", help="really wipe the profile")
 
+    memory_p = sub.add_parser("memory", help="curated memory write-approval gate")
+    memory_sub = memory_p.add_subparsers(dest="memory_command", required=True)
+    memory_sub.add_parser("pending", help="list pending memory writes")
+    memory_approve = memory_sub.add_parser("approve", help="approve a pending write")
+    memory_approve.add_argument("id", help="pending id from `memory pending`")
+    memory_reject = memory_sub.add_parser("reject", help="reject a pending write")
+    memory_reject.add_argument("id", help="pending id from `memory pending`")
+
     sub.add_parser("status", help="show whether the background daemon is running")
     sub.add_parser("stop", help="stop the background daemon")
     sub.add_parser("restart", help="restart the background daemon")
@@ -1148,6 +1190,8 @@ def cli(argv: list[str] | None = None) -> int:
         return _cmd_plugins(config)
     if args.command == "profile":
         return _cmd_profile(args, config)
+    if args.command == "memory":
+        return _cmd_memory(args, config)
     if args.command == "pairing":
         return _cmd_pairing(args, config)
     if args.command == "gateway":
