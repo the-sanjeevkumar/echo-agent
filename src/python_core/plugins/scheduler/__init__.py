@@ -456,6 +456,16 @@ class SchedulerPlugin:
 
         self._save_jobs()
 
+        # Publish job-started event so gateways can notify the originating chat
+        if self._bus:
+            self._bus.publish("scheduler:job_started", {
+                "job_id": job.id,
+                "job_name": job.name,
+                "schedule": job.schedule,
+                "reply_channel": job.reply_channel,
+                "platform": job.platform,
+            }, source="scheduler")
+
         # Execute via orchestrator with reply_channel and platform for gateway routing
         try:
             result = await self._orchestrator.handle_task(
@@ -463,6 +473,7 @@ class SchedulerPlugin:
                 source="scheduler",
                 session_id=job.session_id,
                 reply_channel=job.reply_channel,
+                platform=job.platform,
             )
             logger.info("scheduler: job %s completed (cached=%s)", job.id, result.get("cached", False))
 

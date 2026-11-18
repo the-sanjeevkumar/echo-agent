@@ -213,6 +213,7 @@ class Orchestrator:
             payload.get("text", ""),
             source=payload.get("source", "gateway"),
             reply_channel=payload.get("reply_channel"),
+            platform=payload.get("platform"),
             session_id=payload.get("session_id"),
         )
 
@@ -373,6 +374,7 @@ class Orchestrator:
         *,
         source: str = "cli",
         reply_channel: str | None = None,
+        platform: str | None = None,
         on_event: ProgressCallback | None = None,
         session_id: str | None = None,
     ) -> dict[str, Any]:
@@ -381,6 +383,12 @@ class Orchestrator:
         ``session_id`` isolates chat conversations (gateways pass a per-DM /
         per-channel / per-topic key). Tasks in the same session are serialized,
         so two messages from one chat cannot interleave their history.
+
+        ``reply_channel`` is the platform-prefixed chat target (e.g.
+        ``discord:<channel_id>`` or ``telegram:<chat_id>``) that the response
+        should be delivered back to. ``platform`` ("telegram" | "discord")
+        is used as an additional routing filter so a job triggered from one
+        platform is never echoed on the other.
 
         ``on_event`` is an optional fire-and-forget hook for UIs (the CLI uses
         it to animate a spinner). It receives tiny dicts such as
@@ -396,6 +404,7 @@ class Orchestrator:
                 text,
                 source=source,
                 reply_channel=reply_channel,
+                platform=platform,
                 on_event=on_event,
                 session_id=sid,
             )
@@ -406,7 +415,8 @@ class Orchestrator:
         *,
         source: str,
         reply_channel: str | None,
-        on_event: ProgressCallback | None,
+        platform: str | None = None,
+        on_event: ProgressCallback | None = None,
         session_id: str,
     ) -> dict[str, Any]:
         self.bus.publish("task:received", {"text": text, "source": source}, source="orchestrator")
@@ -423,6 +433,7 @@ class Orchestrator:
                 text,
                 result,
                 reply_channel,
+                platform,
                 elapsed=time.monotonic() - started,
                 cached=True,
                 session_id=session_id,
@@ -527,6 +538,7 @@ class Orchestrator:
             text,
             result,
             reply_channel,
+            platform,
             elapsed=(time.monotonic() - started),
             cached=False,
             session_id=session_id,
@@ -548,6 +560,7 @@ class Orchestrator:
         text: str,
         result: dict[str, Any],
         reply_channel: str | None,
+        platform: str | None = None,
         *,
         elapsed: float,
         cached: bool,
@@ -560,6 +573,7 @@ class Orchestrator:
                 "response": result.get("response", "") or "",
                 "cached": cached,
                 "reply_channel": reply_channel,
+                "platform": platform,
                 "session_id": session_id,
             },
             source="orchestrator",

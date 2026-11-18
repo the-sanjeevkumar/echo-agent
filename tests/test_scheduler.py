@@ -157,7 +157,7 @@ class TestSchedulerPlugin:
             
             # Mock orchestrator
             class MockOrchestrator:
-                async def handle_task(self, text, *, source="scheduler", session_id="scheduler", on_event=None, reply_channel=None):
+                async def handle_task(self, text, *, source="scheduler", session_id="scheduler", on_event=None, reply_channel=None, platform=None):
                     return {"response": f"Executed: {text}", "steps": [], "cached": False, "elapsed_ms": 10}
             
             # Mock kernel context with minimal services
@@ -411,7 +411,7 @@ class TestSchedulerTools:
             
             # Mock orchestrator
             class MockOrchestrator:
-                async def handle_task(self, text, *, source="scheduler", session_id="scheduler", on_event=None, reply_channel=None):
+                async def handle_task(self, text, *, source="scheduler", session_id="scheduler", on_event=None, reply_channel=None, platform=None):
                     return {"response": f"Executed: {text}", "steps": [], "cached": False, "elapsed_ms": 10}
             
             class MockBus:

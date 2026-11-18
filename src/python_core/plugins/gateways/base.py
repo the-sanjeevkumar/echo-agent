@@ -202,6 +202,7 @@ class GatewayInterface(ABC):
         self._bus: EventBus | None = None
         self._ctx: KernelContext | None = None
         self._reply_sub = None
+        self._started_sub = None
         self.pairing: PairingStore | None = None
         self._reply_targets: dict[str, str] = {}
         self._pending: dict[str, int] = {}
@@ -251,6 +252,11 @@ class GatewayInterface(ABC):
             reply_channel = str(payload.get("reply_channel") or "")
             if not reply_channel.startswith(prefix):
                 return
+            # Platform-specific routing: only deliver if the task's platform
+            # matches this gateway (defense-in-depth alongside the prefix check).
+            platform = str(payload.get("platform") or "")
+            if platform and platform != self.name:
+                return
             channel_id = reply_channel[len(prefix):]
             response = str(payload.get("response", "")).strip()
             if not response:
@@ -264,7 +270,30 @@ class GatewayInterface(ABC):
                 logger.debug("gateway delivery traceback", exc_info=True)
                 await self._on_task_completed(channel_id, response, ok=False)
 
+        async def _on_job_started(event: Any) -> None:
+            """Notify the originating chat that a scheduled job has started."""
+            payload = getattr(event, "payload", event) or {}
+            reply_channel = str(payload.get("reply_channel") or "")
+            if not reply_channel.startswith(prefix):
+                return
+            platform = str(payload.get("platform") or "")
+            if platform and platform != self.name:
+                return
+            channel_id = reply_channel[len(prefix):]
+            job_name = str(payload.get("job_name") or "job")
+            job_id = str(payload.get("job_id") or "?")
+            try:
+                await self.send_reply(
+                    channel_id,
+                    f"🔄 Cron job `{job_name}` ({job_id}) started…",
+                )
+            except Exception as exc:  # start notice is cosmetic
+                logger.warning("%s failed to send job-started notice to %s: %s", self.name, channel_id, exc)
+
         self._reply_sub = bus.subscribe("task:completed", _on_completed, label=f"gateway.{self.name}.reply")
+        self._started_sub = bus.subscribe(
+            "scheduler:job_started", _on_job_started, label=f"gateway.{self.name}.job-started"
+        )
 
     async def _on_task_completed(self, channel_id: str, response: str, *, ok: bool) -> None:
         """Hook for gateways to react or update status when a task completes.
@@ -278,6 +307,9 @@ class GatewayInterface(ABC):
         if self._bus is not None and self._reply_sub is not None:
             self._bus.unsubscribe(self._reply_sub)
             self._reply_sub = None
+        if self._bus is not None and self._started_sub is not None:
+            self._bus.unsubscribe(self._started_sub)
+            self._started_sub = None
         for task in list(self._typing_tasks.values()):
             task.cancel()
         self._typing_tasks.clear()
