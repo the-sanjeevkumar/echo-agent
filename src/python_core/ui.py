@@ -20,6 +20,7 @@ Two pieces the CLI uses:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -194,15 +195,29 @@ class Spinner:
 
     def on_event(self, event: dict[str, Any]) -> None:
         """Callable handed to ``Orchestrator.handle_task(on_event=...)``."""
-        kind = event.get("type")
+        kind = event.get("type") or event.get("kind")
+        tool = event.get("tool") or "?"
         if kind == "thinking":
             self.set_status("thinking")
         elif kind == "tool":
-            self.set_status(f"tool: {event.get('tool') or '?'}")
+            args = event.get("args") or {}
+            gist = json.dumps(args, default=str)[:60] if args else ""
+            self.set_status(f"tool: {tool} {gist}".rstrip())
         elif kind == "invalid_tool":
-            self.set_status(f"unknown tool: {event.get('tool') or '?'}")
+            self.set_status(f"unknown tool: {tool}")
         elif kind == "tool_result":
-            self.set_status("thinking")
+            self.set_status(f"{tool}: {'ok' if event.get('ok') else 'FAIL'}")
+        elif kind == "file_edit":
+            diff = str(event.get("diff") or "").replace("\n", " ")[:80]
+            self.set_status(f"edit: {diff}")
+        elif kind == "memory":
+            self.set_status("💾 memory updated")
+        elif kind == "skill":
+            self.set_status("🛠 skill created")
+        elif kind == "selfheal":
+            self.set_status("🩹 patch applied")
+        elif kind == "supervisor":
+            self.set_status("🛰 delegated")
         elif kind == "cached":
             self.set_status("cached")
 

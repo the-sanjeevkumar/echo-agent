@@ -574,6 +574,21 @@ class TelegramGateway(GatewayInterface):
                     pass
             await self._api("sendMessage", **payload)
 
+    async def send_status_create(self, channel_id: str, text: str) -> str:
+        data = await self._api(
+            "sendMessage", chat_id=channel_id, text=text[:MAX_MESSAGE],
+            disable_web_page_preview=True,
+        )
+        return str((data.get("result") or {}).get("message_id") or "")
+
+    async def send_status_edit(self, channel_id: str, message_id: str, text: str) -> None:
+        if not message_id:
+            return
+        await self._api(
+            "editMessageText", chat_id=channel_id, message_id=int(message_id),
+            text=text[:MAX_MESSAGE],
+        )
+
     async def send_typing(self, channel_id: str) -> None:
         await self._api("sendChatAction", chat_id=channel_id, action="typing")
 

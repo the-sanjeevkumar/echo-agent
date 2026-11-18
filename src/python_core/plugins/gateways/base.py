@@ -210,6 +210,10 @@ class GatewayInterface(ABC):
         self._typing_enabled = False
         self._typing_interval = 4.5
         self._notification_task: asyncio.Task[None] | None = None
+        # Phase 5: one editable status message per in-flight task.
+        self._progress_sub = None
+        self._notice_subs: list[Any] = []
+        self._status: dict[str, dict[str, Any]] = {}
 
     # ── lifecycle (ABC contract mirrors Plugin Protocol) ───────────────────
     @abstractmethod
@@ -262,6 +266,9 @@ class GatewayInterface(ABC):
             if not response:
                 return
             self._finish_typing(channel_id)
+            # Phase 5: end the editable status with a compact summary, then
+            # deliver the final answer as a separate message.
+            await self._finalize_status(channel_id, payload)
             try:
                 await self.send_reply(channel_id, response)
                 await self._on_task_completed(channel_id, response, ok=True)
@@ -294,6 +301,34 @@ class GatewayInterface(ABC):
         self._started_sub = bus.subscribe(
             "scheduler:job_started", _on_job_started, label=f"gateway.{self.name}.job-started"
         )
+        # Phase 5: live progress → one editable status message per task.
+        async def _on_progress(event: Any) -> None:
+            await self._handle_progress(getattr(event, "payload", event) or {})
+
+        self._progress_sub = bus.subscribe(
+            "task:progress", _on_progress, label=f"gateway.{self.name}.progress"
+        )
+
+        # Hermes-style notifications from plugin events → active status lines.
+        async def _on_notice(event: Any, kind: str = "") -> None:
+            payload = getattr(event, "payload", event) or {}
+            detail = str(payload.get("name") or payload.get("target_file") or payload.get("agent") or "")[:200]
+            await self._handle_notification(kind, detail)
+
+        self._notice_subs: list[Any] = []
+        for topic, kind in (
+            ("memory:consolidated", "memory"),
+            ("skill:synthesized", "skill"),
+            ("skill:patched", "skill"),
+            ("skill:ingested", "skill"),
+            ("selfheal:applied", "selfheal"),
+            ("learning:patch_proposed", "selfheal"),
+            ("supervisor:delegated", "supervisor"),
+        ):
+            self._notice_subs.append(
+                bus.subscribe(topic, lambda event, k=kind: _on_notice(event, k),
+                              label=f"gateway.{self.name}.notice.{kind}")
+            )
 
     async def _on_task_completed(self, channel_id: str, response: str, *, ok: bool) -> None:
         """Hook for gateways to react or update status when a task completes.
@@ -303,6 +338,124 @@ class GatewayInterface(ABC):
         """
         pass
 
+    # ── Phase 5: editable status messages ──────────────────────────────────
+    _STATUS_ICONS = {
+        "thinking": "💭", "tool": "⚙", "tool_result": "✓", "file_edit": "✎",
+        "memory": "💾", "skill": "🛠", "selfheal": "🩹", "supervisor": "🛰",
+        "cached": "⚡", "invalid_tool": "⚠",
+    }
+    _NOTICE_ICONS = {
+        "memory": "💾 Memory updated",
+        "skill": "🛠 Skill created",
+        "selfheal": "🩹 Patch applied",
+        "supervisor": "🛰 Delegated",
+    }
+
+    async def send_status_create(self, channel_id: str, text: str) -> str:
+        """Create the status message; return its platform message id."""
+        return ""
+
+    async def send_status_edit(self, channel_id: str, message_id: str, text: str) -> None:
+        """Edit the existing status message."""
+
+    async def send_status_finalize(self, channel_id: str, message_id: str, text: str) -> None:
+        """Turn the status message into a compact summary line."""
+        await self.send_status_edit(channel_id, message_id, text)
+
+    @staticmethod
+    def _status_line(payload: dict[str, Any]) -> str:
+        kind = str(payload.get("kind") or payload.get("type") or "progress")
+        detail = str(payload.get("detail") or "")[:300]
+        icon = GatewayInterface._STATUS_ICONS.get(kind, "•")
+        if kind == "tool_result" and payload.get("ok") is False:
+            icon = "✗"
+        if kind == "tool_result" and str(payload.get("detail", "")).endswith("FAIL"):
+            return f"{icon} {detail}"
+        if not detail:
+            detail = kind
+        return f"{icon} {detail}"
+
+    async def _handle_progress(self, payload: dict[str, Any]) -> None:
+        """Create/edit ONE status message per task; debounce edits."""
+        try:
+            if str(getattr(self.config, "gateway_progress", "compact")).lower() == "off":
+                return
+            reply_channel = str(payload.get("reply_channel") or "")
+            prefix = f"{self.name}:"
+            if not reply_channel.startswith(prefix):
+                return
+            platform = str(payload.get("platform") or "")
+            if platform and platform != self.name:
+                return
+            channel_id = reply_channel[len(prefix):]
+            kind = str(payload.get("kind") or payload.get("type") or "")
+            verbose = str(getattr(self.config, "gateway_progress", "compact")).lower() == "verbose"
+            if kind == "thinking" and not verbose:
+                return  # compact mode hides per-step chatter
+
+            session_id = str(payload.get("session_id") or "")
+            state = self._status.get(channel_id)
+            line = self._status_line(payload)
+            now = asyncio.get_running_loop().time()
+            if state is None or state.get("session") != session_id:
+                if state is not None and state.get("message_id"):
+                    await self.send_status_finalize(channel_id, state["message_id"], "✅ done")
+                text = f"🔄 working…\n{line}"
+                message_id = await self.send_status_create(channel_id, text)
+                self._status[channel_id] = {
+                    "session": session_id,
+                    "message_id": message_id,
+                    "lines": [line],
+                    "last_edit": now,
+                    "last_text": text,
+                }
+                return
+
+            lines: list[str] = state["lines"]
+            if line not in lines:
+                lines.append(line)
+                state["lines"] = lines[-12:]  # bound status height
+            debounce = max(0.0, float(getattr(self.config, "gateway_status_debounce", 2.0)))
+            if now - float(state["last_edit"]) < debounce:
+                return  # rate-limit aware: accumulate, edit on a later tick
+            text = "🔄 working…\n" + "\n".join(state["lines"])
+            if state.get("message_id"):
+                await self.send_status_edit(channel_id, state["message_id"], text)
+            state["last_edit"] = now
+            state["last_text"] = text
+        except Exception as exc:  # noqa: BLE001 — streaming never breaks the task
+            logger.debug("%s progress handling failed: %s", self.name, exc)
+
+    async def _handle_notification(self, kind: str, detail: str) -> None:
+        """Append a Hermes-style notice to every active status message."""
+        notice = self._NOTICE_ICONS.get(kind)
+        if notice is None or not self._status:
+            return
+        line = f"{notice}: {detail}".rstrip(": ")[:300]
+        for channel_id, state in list(self._status.items()):
+            lines = state.setdefault("lines", [])
+            lines.append(line)
+            state["lines"] = lines[-12:]
+            if state.get("message_id"):
+                try:
+                    await self.send_status_edit(
+                        channel_id, state["message_id"], "🔄 working…\n" + "\n".join(state["lines"])
+                    )
+                except Exception as exc:  # noqa: BLE001 — cosmetic
+                    logger.debug("%s notice edit failed: %s", self.name, exc)
+
+    async def _finalize_status(self, channel_id: str, payload: dict[str, Any]) -> None:
+        """Finalize the status message with a compact summary line."""
+        state = self._status.pop(channel_id, None)
+        if state is None or not state.get("message_id"):
+            return
+        steps = payload.get("steps") or []
+        summary = f"✅ done · {len(steps)} step(s)" if steps else "✅ done"
+        try:
+            await self.send_status_finalize(channel_id, state["message_id"], summary)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("%s status finalize failed: %s", self.name, exc)
+
     def unbind_bus(self) -> None:
         if self._bus is not None and self._reply_sub is not None:
             self._bus.unsubscribe(self._reply_sub)
@@ -310,6 +463,14 @@ class GatewayInterface(ABC):
         if self._bus is not None and self._started_sub is not None:
             self._bus.unsubscribe(self._started_sub)
             self._started_sub = None
+        if self._bus is not None and self._progress_sub is not None:
+            self._bus.unsubscribe(self._progress_sub)
+            self._progress_sub = None
+        for sub in self._notice_subs:
+            if self._bus is not None:
+                self._bus.unsubscribe(sub)
+        self._notice_subs.clear()
+        self._status.clear()
         for task in list(self._typing_tasks.values()):
             task.cancel()
         self._typing_tasks.clear()

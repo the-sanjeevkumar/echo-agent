@@ -475,6 +475,13 @@ class Orchestrator:
     ) -> dict[str, Any]:
         self.bus.publish("task:received", {"text": text, "source": source}, source="orchestrator")
         started = time.monotonic()
+        # Phase 5: progress events published alongside the CLI callback.
+        self._progress_ctx = {
+            "session_id": session_id,
+            "reply_channel": reply_channel,
+            "platform": platform,
+            "task": text[:300],
+        }
 
         # Profile management command (owner-only, confirmation-gated).
         forget_parts = text.lstrip("/").strip().lower().split()
@@ -580,6 +587,11 @@ class Orchestrator:
             ok = bool(result.get("ok"))
             steps.append({"step": step_idx, "tool": tool_name, "args": args, "ok": ok})
             self._notify(on_event, {"type": "tool_result", "step": step_idx, "tool": tool_name, "ok": ok})
+            if ok and tool_name in {"fs_apply_diff", "fs_write"}:
+                diff_gist = str(args.get("diff") or args.get("content") or "")[:300]
+                self._notify(on_event, {
+                    "type": "file_edit", "tool": tool_name, "diff": diff_gist, "step": step_idx,
+                })
 
             # Compact observation (delta-first policy keeps this small).
             observation = json.dumps(result, default=str)
@@ -760,15 +772,42 @@ class Orchestrator:
             }
         return {"response": response, "steps": [], "cached": False, "session_id": session_id}
 
-    @staticmethod
-    def _notify(on_event: ProgressCallback | None, event: dict[str, Any]) -> None:
-        """Deliver a UI progress event; UI failures never affect the loop."""
-        if on_event is None:
-            return
+    def _notify(self, on_event: ProgressCallback | None, event: dict[str, Any]) -> None:
+        """Deliver a progress event to the local UI callback AND the bus.
+
+        Streaming is cosmetic: any failure is logged and NEVER breaks the loop.
+        """
+        if on_event is not None:
+            try:
+                on_event(event)
+            except Exception:  # UI failure is cosmetic
+                logger.debug("progress callback failed", exc_info=True)
         try:
-            on_event(event)
-        except Exception:  # noqa: BLE001
-            logger.debug("progress callback failed", exc_info=True)
+            payload = dict(event)
+            ctx = getattr(self, "_progress_ctx", None) or {}
+            payload.update(ctx)
+            payload.setdefault("session_id", "main")
+            payload["kind"] = str(event.get("type") or event.get("kind") or "progress")
+            payload["detail"] = str(event.get("detail") or self._progress_detail(event))[:400]
+            self.bus.publish("task:progress", payload, source="orchestrator")
+        except Exception:  # streaming must never break the loop
+            logger.debug("progress publish failed", exc_info=True)
+
+    @staticmethod
+    def _progress_detail(event: dict[str, Any]) -> str:
+        kind = str(event.get("type") or "")
+        tool = event.get("tool") or ""
+        if kind == "tool":
+            args = event.get("args") or {}
+            gist = json.dumps(args, default=str)[:120]
+            return f"{tool}({gist})" if tool else gist
+        if kind == "tool_result":
+            return f"{tool}: {'ok' if event.get('ok') else 'FAIL'}"
+        if kind in {"thinking", "invalid_tool"}:
+            return f"step {event.get('step', '?')}" + (f" · {tool}" if tool else "")
+        if kind == "file_edit":
+            return str(event.get("diff", ""))[:300]
+        return kind
 
     def _finish(
         self,

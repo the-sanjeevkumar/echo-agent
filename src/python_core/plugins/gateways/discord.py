@@ -777,6 +777,22 @@ class DiscordGateway(GatewayInterface):
                 else:
                     logger.warning("discord send failed: %s", exc)
 
+    async def send_status_create(self, channel_id: str, text: str) -> str:
+        channel = await self._resolve_channel(channel_id)
+        if channel is None:
+            return ""
+        message = await channel.send(text[:DISCORD_CHUNK])
+        return str(getattr(message, "id", "") or "")
+
+    async def send_status_edit(self, channel_id: str, message_id: str, text: str) -> None:
+        if not message_id:
+            return
+        channel = await self._resolve_channel(channel_id)
+        if channel is None:
+            return
+        message = await channel.fetch_message(int(message_id))
+        await message.edit(content=text[:DISCORD_CHUNK])
+
     async def send_typing(self, channel_id: str) -> None:
         channel = await self._resolve_channel(channel_id)
         if channel is None:
