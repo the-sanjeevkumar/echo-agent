@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "echo-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first, self-improving, event-driven polyglot AI agent"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -55,6 +55,7 @@ dev = ["pytest-asyncio>=0.23", "pytest-timeout>=2.3", "ruff>=0.4"]
 
 [project.scripts]
 echo-agent = "python_core.main:cli"
+echo-uninstall = "python_core.uninstall:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

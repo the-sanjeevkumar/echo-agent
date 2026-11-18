@@ -7,4 +7,4 @@ Package layout:
     python_core.inter_agent   universal HTTP/JSON-RPC agent protocol layer
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
