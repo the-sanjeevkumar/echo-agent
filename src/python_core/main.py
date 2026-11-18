@@ -40,6 +40,7 @@ from python_core.core.event_bus import EventBus
 from python_core.core.interfaces import KernelContext, ToolSpec
 from python_core.core.plugin_manager import PluginManager
 from python_core.core.tool_registry import ToolRegistry
+from python_core.lifecycle import is_setup_complete
 from python_core.inter_agent.manifest_server import ManifestServer
 from python_core.orchestrator import Orchestrator
 from python_core.plugins.gateways.discord import DiscordGateway
@@ -50,6 +51,7 @@ from python_core.plugins.memory.plugin import CognitiveMemoryPlugin
 from python_core.plugins.self_healing.plugin import SelfHealingPlugin
 from python_core.plugins.skills.ingester import SkillIngester
 from python_core.plugins.web.plugin import WebPlugin
+from python_core.setup_wizard import SetupOptions, run_setup
 from python_core.ui import (
     Spinner,
     banner,
@@ -913,6 +915,27 @@ def _cmd_bus(config: EchoConfig) -> int:
     return proc.returncode or 0
 
 
+def _first_run_hook(config: EchoConfig, args: argparse.Namespace) -> None:
+    """Launch the wizard on first interactive run; stay silent for scripts.
+
+    The kernel boots without an LLM, so a non-TTY run only gets one hint line
+    and otherwise continues with defaults.
+    """
+    if getattr(args, "no_setup", False) or is_setup_complete(config.data_dir):
+        return
+    try:
+        interactive = sys.stdin.isatty()
+    except (AttributeError, ValueError, OSError):
+        interactive = False
+    if not interactive:
+        print("hint: run `echo-agent setup` to configure; continuing with defaults")
+        return
+    print("first run — launching setup wizard…")
+    code = run_setup(config, SetupOptions())
+    if code != 0:
+        raise SystemExit(code)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Argparse wiring
 # ─────────────────────────────────────────────────────────────────────────────
@@ -920,14 +943,35 @@ def cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="echo-agent", description="Local-first self-improving AI agent")
     parser.add_argument("--config", default=None, help="path to config.toml")
     parser.add_argument("--verbose", "-v", action="store_true")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command", required=False)
+
+    setup_p = sub.add_parser("setup", aliases=["onboard"], help="interactive first-run setup wizard")
+    setup_p.add_argument("--reset", action="store_true", help="ignore existing configuration")
+    setup_p.add_argument("--quick", action="store_true", help="accept all defaults, no prompts")
+    setup_p.add_argument("--llm-base-url")
+    setup_p.add_argument("--llm-model")
+    setup_p.add_argument("--llm-api-key")
+    setup_p.add_argument("--telegram-token")
+    setup_p.add_argument("--discord-token")
+    setup_p.add_argument("--data-dir")
+    setup_p.add_argument("--port", type=int)
+    setup_p.add_argument("--yes", "-y", action="store_true", help="non-interactive")
 
     run_p = sub.add_parser("run", help="execute one task")
     run_p.add_argument("task", help="task text")
     run_p.add_argument("--json", action="store_true", dest="as_json", help="machine-readable JSON output (also implied when stdout is not a TTY)")
+    run_p.add_argument("--no-setup", action="store_true", help="skip the first-run wizard")
 
     start_p = sub.add_parser("start", help="daemon mode (manifest server + gateways + REPL)")
     start_p.add_argument("--headless", action="store_true", help="no REPL; run until signaled")
+    start_p.add_argument("--no-setup", action="store_true", help="skip the first-run wizard")
+
+    agent_p = sub.add_parser("agent", help="alias for `start`")
+    agent_p.add_argument("--headless", action="store_true", help="no REPL; run until signaled")
+    agent_p.add_argument("--no-setup", action="store_true", help="skip the first-run wizard")
+
+    doctor_p = sub.add_parser("doctor", help="diagnose the installation")
+    doctor_p.add_argument("--probe", action="store_true", help="probe LLM endpoint and gateway tokens")
 
     skills_p = sub.add_parser("skills", help="skill management")
     skills_sub = skills_p.add_subparsers(dest="skills_command", required=True)
@@ -1021,9 +1065,36 @@ def cli(argv: list[str] | None = None) -> int:
 
     config = EchoConfig.load(args.config)
 
+    if args.command is None:
+        if not is_setup_complete(config.data_dir):
+            return run_setup(config, SetupOptions())
+        parser.print_help()
+        print()
+        _cmd_status(config)
+        return 0
+    if args.command in {"setup", "onboard"}:
+        return run_setup(config, SetupOptions(
+            reset=args.reset,
+            quick=args.quick,
+            llm_base_url=args.llm_base_url,
+            llm_model=args.llm_model,
+            llm_api_key=args.llm_api_key,
+            telegram_token=args.telegram_token,
+            discord_token=args.discord_token,
+            data_dir=args.data_dir,
+            port=args.port,
+            yes=args.yes,
+            interactive=False if args.yes else None,
+        ))
+    if args.command == "doctor":
+        from python_core.doctor import run_doctor
+
+        return run_doctor(config, probe=args.probe)
     if args.command == "run":
+        _first_run_hook(config, args)
         return asyncio.run(_cmd_run(args.task, config, as_json=args.as_json))
-    if args.command == "start":
+    if args.command in {"start", "agent"}:
+        _first_run_hook(config, args)
         return asyncio.run(_cmd_start(args, config))
     if args.command == "skills":
         if args.skills_command == "add":
