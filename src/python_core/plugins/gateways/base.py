@@ -316,6 +316,23 @@ class GatewayInterface(ABC):
             await self._handle_notification(kind, detail)
 
         self._notice_subs: list[Any] = []
+        # Server-health alerts → owner chat (Phase 6).
+        async def _on_server_alert(event: Any) -> None:
+            payload = getattr(event, "payload", event) or {}
+            channel = str(payload.get("reply_channel") or "")
+            if not channel.startswith(prefix):
+                return
+            platform = str(payload.get("platform") or "")
+            if platform and platform != self.name:
+                return
+            text = f"🚨 {str(payload.get('severity', 'warning')).upper()}: {payload.get('message', 'server alert')}"
+            try:
+                await self.send_reply(channel[len(prefix):], text)
+            except Exception as exc:  # noqa: BLE001 — alert delivery is cosmetic
+                logger.debug("%s alert delivery failed: %s", self.name, exc)
+
+        self._notice_subs.append(bus.subscribe("server:alert", _on_server_alert, label=f"gateway.{self.name}.alert"))
+
         for topic, kind in (
             ("memory:consolidated", "memory"),
             ("skill:synthesized", "skill"),

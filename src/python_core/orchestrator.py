@@ -499,6 +499,17 @@ class Orchestrator:
             )
             return result
 
+        # Server-ops chat confirmation (owner-only, Phase 6).
+        confirm_parts = text.lstrip("/").strip().lower().split()
+        if confirm_parts and confirm_parts[0] == "confirm" and len(confirm_parts) == 2:
+            result = await self._handle_confirm(text, user_id=user_id, source=source, session_id=session_id)
+            self._finish(
+                text, result, reply_channel, platform,
+                elapsed=time.monotonic() - started, cached=False,
+                session_id=session_id, user_id=user_id, source=source,
+            )
+            return result
+
         # Code-patch approvals (owner-only chat command, Phase 4).
         patch_parts = text.lstrip("/").strip().lower().split()
         if patch_parts and patch_parts[0] == "patch" and len(patch_parts) <= 3:
@@ -710,6 +721,47 @@ class Orchestrator:
             "steps": [],
             "cached": False,
             "session_id": session_id,
+        }
+
+    async def _handle_confirm(
+        self,
+        text: str,
+        *,
+        user_id: str | None,
+        source: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """``/confirm <id>`` approves a pending server-ops mutation."""
+        services = getattr(self, "_ctx", None)
+        ops = services.service("server_ops") if services is not None else None
+        memory = self.memory
+        if ops is None or memory is None or not hasattr(memory, "profiles"):
+            return {
+                "response": "⚠ confirmations are unavailable right now.",
+                "steps": [], "cached": False, "session_id": session_id,
+            }
+        key = memory.profiles.resolve_key(user_id or "", source)
+        if not memory.profiles.is_owner(key):
+            return {
+                "response": "⚠ confirmations are owner-only.",
+                "steps": [], "cached": False, "session_id": session_id,
+            }
+        try:
+            outcome = await ops.confirm(text.strip().split()[-1])
+        except Exception:  # noqa: BLE001
+            logger.exception("confirmation failed")
+            return {
+                "response": "⚠ couldn't complete the confirmation.",
+                "steps": [], "cached": False, "session_id": session_id,
+            }
+        if outcome.get("ok"):
+            return {
+                "response": f"✅ Confirmed: {outcome.get('unit')} restarted.",
+                "steps": [], "cached": False, "session_id": session_id,
+            }
+        return {
+            "response": f"⚠ {outcome.get('error', 'confirmation failed')}",
+            "steps": [], "cached": False, "session_id": session_id,
         }
 
     # ── code-patch approvals (/patch, owner-only, Phase 4) ────────────────

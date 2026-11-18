@@ -136,6 +136,16 @@ class EchoConfig:
     review_min_failure_count: int = 3         # recurring failures before patch proposal
     auto_apply_if_tests_pass: bool = False    # code patches need chat approval by default
 
+    # ── server operations (PHASE 6) ────────────────────────────────────────
+    server_ops_enabled: bool = True             # read-only server tools available
+    server_ops_units: list[str] = field(default_factory=list)          # systemd allowlist
+    server_ops_preapproved_units: list[str] = field(default_factory=list)  # skip /confirm
+    server_ops_confirm_ttl: float = 120.0       # confirmation window (seconds)
+    server_ops_health_interval: str = "every 5m"  # scheduler cadence
+    server_ops_disk_threshold: float = 90.0     # percent
+    server_ops_ram_threshold: float = 90.0      # percent
+    server_ops_alerts_reply_channel: str = ""   # e.g. "telegram:<chat_id>"
+
     def __post_init__(self) -> None:
         self.data_dir = Path(self.data_dir).expanduser()
         # Keep policy values in a known set; an invalid value must fail safe
@@ -164,6 +174,8 @@ class EchoConfig:
             "discord_channels",
             "telegram_groups",
             "owner_user_ids",
+            "server_ops_units",
+            "server_ops_preapproved_units",
         ):
             value = getattr(self, list_field)
             if isinstance(value, str):
@@ -277,6 +289,7 @@ class EchoConfig:
             "ECHO_EMBEDDINGS_BACKEND": "embeddings_backend",
             "ECHO_EMBEDDING_MODEL_DIR": "embedding_model_dir",
             "ECHO_ENABLE_EMBEDDINGS": "enable_embeddings",
+            "ECHO_SERVER_OPS_ENABLED": "server_ops_enabled",
         }
         for env_key, field_name in env_map.items():
             if env_key in os.environ:
@@ -294,6 +307,7 @@ class EchoConfig:
             ("ECHO_ENABLE_EMBEDDINGS", "enable_embeddings"),
             ("ECHO_LEARNING_ENABLED", "learning_enabled"),
             ("ECHO_AUTO_APPLY_IF_TESTS_PASS", "auto_apply_if_tests_pass"),
+            ("ECHO_SERVER_OPS_ENABLED", "server_ops_enabled"),
         ):
             if env_key in os.environ:
                 values[field_name] = os.environ[env_key].strip().lower() in {"1", "true", "yes", "on"}
