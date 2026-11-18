@@ -48,6 +48,7 @@ from python_core.plugins.gateways.pairing import PairingStore
 from python_core.plugins.gateways.telegram import TelegramGateway
 from python_core.plugins.llm.openai_compat import OpenAICompatProvider
 from python_core.plugins.memory.plugin import CognitiveMemoryPlugin
+from python_core.plugins.scheduler import SchedulerPlugin
 from python_core.plugins.self_healing.plugin import SelfHealingPlugin
 from python_core.plugins.skills.ingester import SkillIngester
 from python_core.plugins.web.plugin import WebPlugin
@@ -259,6 +260,7 @@ async def build_kernel(
     pm.register(SelfHealingPlugin(config))
     pm.register(SkillIngester(config))
     pm.register(WebPlugin(config))
+    pm.register(SchedulerPlugin(config))
     from python_core.inter_agent.universal_client import UniversalClientPlugin
 
     pm.register(UniversalClientPlugin(config))
