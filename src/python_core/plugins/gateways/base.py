@@ -258,11 +258,21 @@ class GatewayInterface(ABC):
             self._finish_typing(channel_id)
             try:
                 await self.send_reply(channel_id, response)
+                await self._on_task_completed(channel_id, response, ok=True)
             except Exception as exc:  # noqa: BLE001 — delivery failure must not kill the bus
                 logger.warning("%s failed to deliver reply to %s: %s", self.name, channel_id, exc)
                 logger.debug("gateway delivery traceback", exc_info=True)
+                await self._on_task_completed(channel_id, response, ok=False)
 
         self._reply_sub = bus.subscribe("task:completed", _on_completed, label=f"gateway.{self.name}.reply")
+
+    async def _on_task_completed(self, channel_id: str, response: str, *, ok: bool) -> None:
+        """Hook for gateways to react or update status when a task completes.
+
+        Default does nothing. Subclasses override to add emoji reactions,
+        status-message edits, etc.
+        """
+        pass
 
     def unbind_bus(self) -> None:
         if self._bus is not None and self._reply_sub is not None:
@@ -466,12 +476,14 @@ class GatewayInterface(ABC):
             f"echo-agent · {platform}\n\n"
             f"{p}ask <text>          run a task\n"
             f"{p}status              session + model status\n"
-            f"{p}reset               clear this chat's session\n"
+            f"{p}model [name]        show or change the LLM model\n"
+            f"{p}reset / {p}new        clear this chat's session\n"
             f"{p}whoami              show your sender/chat ids\n"
             f"{p}activation always   stop requiring @mentions in this group\n"
             f"{p}activation mention  require @mentions again\n"
             f"{p}help                this message\n\n"
-            "In DMs you can also just type normally."
+            "In DMs you can also just type normally.\n\n"
+            "Reactions: 👀 = received, ✅ = done, ❌ = failed."
         )
 
 

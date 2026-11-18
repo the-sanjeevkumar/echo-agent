@@ -62,6 +62,7 @@ class DiscordGateway(GatewayInterface):
         self._activation: dict[str, bool] = {}
         self._introduced: set[int] = set()
         self._commands_synced = False
+        self._reaction_messages: dict[str, Any] = {}
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def start(self, ctx: KernelContext) -> None:
@@ -206,6 +207,11 @@ class DiscordGateway(GatewayInterface):
         async def help_command(interaction: Any) -> None:
             await self._respond_ephemeral(interaction, self.help_text("Discord", "/"))
 
+        @tree.command(name="model", description="Show or change the LLM model")
+        @discord.app_commands.describe(name="New model name (leave blank to show current)")
+        async def model(interaction: Any, name: str = "") -> None:
+            await self._slash_model(interaction, name.strip())
+
     async def _slash_context(self, interaction: Any) -> tuple[Admission, bool, str, str]:
         is_dm = interaction.guild is None
         channel_id = str(interaction.channel_id or "")
@@ -266,10 +272,10 @@ class DiscordGateway(GatewayInterface):
         )
 
     async def _slash_status(self, interaction: Any) -> None:
-        admission, _is_dm, _channel_id, session_id = await self._slash_context(interaction)
-        if not admission.allowed:
-            await self._slash_denied(interaction, admission, interaction.guild is None)
-            return
+        # Info command — no admission check needed (pairing not required).
+        _is_dm = interaction.guild is None
+        channel_id = str(interaction.channel_id or "")
+        session_id = self._session_id(channel_id, is_dm=_is_dm, guild_id=str(interaction.guild_id or "") or None)
         status = None
         if self._bus is not None:
             status = await self._bus.request("session:status", {"session_id": session_id}, timeout=5.0)
@@ -284,10 +290,10 @@ class DiscordGateway(GatewayInterface):
         )
 
     async def _slash_reset(self, interaction: Any) -> None:
-        admission, _is_dm, _channel_id, session_id = await self._slash_context(interaction)
-        if not admission.allowed:
-            await self._slash_denied(interaction, admission, interaction.guild is None)
-            return
+        # Info/session command — no admission check needed (pairing not required).
+        _is_dm = interaction.guild is None
+        channel_id = str(interaction.channel_id or "")
+        session_id = self._session_id(channel_id, is_dm=_is_dm, guild_id=str(interaction.guild_id or "") or None)
         if self._bus is not None:
             await self._bus.emit("session:reset", {"session_id": session_id}, source="discord")
         await self._respond_ephemeral(interaction, "🧹 session cleared for this channel.")
@@ -318,6 +324,22 @@ class DiscordGateway(GatewayInterface):
             await self._respond_ephemeral(interaction, "🔕 mention requirement on for this channel.")
         else:
             await self._respond_ephemeral(interaction, "usage: /activation always | mention")
+
+    async def _slash_model(self, interaction: Any, name: str) -> None:
+        # Info command — no admission check needed (pairing not required).
+        if not name:
+            await self._respond_ephemeral(
+                interaction,
+                f"current model: {getattr(self.config, 'llm_model', '?')}\n"
+                f"usage: /model <new-model-name>",
+            )
+            return
+        self.config.llm_model = name
+        await self._respond_ephemeral(
+            interaction,
+            f"✅ model changed to: {self.config.llm_model}\n"
+            f"Next request will use this model.",
+        )
 
     async def _respond_ephemeral(self, interaction: Any, text: str) -> None:
         try:
@@ -360,13 +382,32 @@ class DiscordGateway(GatewayInterface):
         if not content:
             return
 
-        admission, is_dm, channel_id, session_id = self._context_for_message(message)
+        is_dm = message.guild is None
+        channel_id = str(message.channel.id)
+        session_id = self._session_id(
+            channel_id, is_dm=is_dm, guild_id=str(message.guild.id) if message.guild else None
+        )
+
+        prefix = str(self.config.discord_command_prefix or "!")
+        command, args = self._parse_prefix(content, prefix)
+        info_commands = {"model", "status", "whoami", "help", "reset", "new"}
+        if command is not None and command in info_commands:
+            # Info/session commands work without pairing in DMs.
+            await self._handle_prefix(
+                command=command,
+                args=args,
+                message=message,
+                channel_id=channel_id,
+                is_dm=is_dm,
+                session_id=session_id,
+            )
+            return
+
+        admission, _is_dm, _channel_id, _session_id = self._context_for_message(message)
         if not admission.allowed:
             await self._notify_denied(channel_id, admission, is_dm, author.id)
             return
 
-        prefix = str(self.config.discord_command_prefix or "!")
-        command, args = self._parse_prefix(content, prefix)
         if command is not None:
             await self._handle_prefix(
                 command=command,
@@ -403,6 +444,12 @@ class DiscordGateway(GatewayInterface):
             chat_type="dm" if is_dm else "group",
             chat_id=channel_id,
         )
+        # React with eyes to show we received the message and are working on it.
+        self._reaction_messages[str(channel_id)] = message
+        try:
+            await message.add_reaction("👀")
+        except Exception:  # noqa: BLE001 — reaction is cosmetic
+            logger.debug("discord eyes reaction failed", exc_info=True)
 
     def _context_for_message(self, message: Any) -> tuple[Admission, bool, str, str]:
         is_dm = message.guild is None
@@ -534,6 +581,21 @@ class DiscordGateway(GatewayInterface):
                 await self.send_reply(channel_id, "🔕 mention requirement on for this channel.")
             else:
                 await self.send_reply(channel_id, "usage: !activation always | mention")
+            return
+        if command == "model":
+            if not args:
+                await self.send_reply(
+                    channel_id,
+                    f"current model: {getattr(self.config, 'llm_model', '?')}\n"
+                    f"usage: !model <new-model-name>",
+                )
+                return
+            self.config.llm_model = args.strip()
+            await self.send_reply(
+                channel_id,
+                f"✅ model changed to: {self.config.llm_model}\n"
+                f"Next request will use this model.",
+            )
             return
         await self.send_reply(channel_id, f"unknown command: {command}\n\n" + self.help_text("Discord", self.config.discord_command_prefix))
 
@@ -684,6 +746,16 @@ class DiscordGateway(GatewayInterface):
         async with channel.typing():
             await asyncio.sleep(0.05)
 
+    async def _on_task_completed(self, channel_id: str, response: str, *, ok: bool) -> None:
+        """React ✅ on success, ❌ on failure, and clear the stored message."""
+        message = self._reaction_messages.pop(str(channel_id), None)
+        if message is None:
+            return
+        emoji = "✅" if ok else "❌"
+        try:
+            await message.add_reaction(emoji)
+        except Exception:  # noqa: BLE001 — reaction is cosmetic
+            logger.debug("discord completion reaction failed", exc_info=True)
 
 def create_plugin() -> DiscordGateway:
     return DiscordGateway()

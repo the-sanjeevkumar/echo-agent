@@ -500,7 +500,7 @@ class Orchestrator:
             response = action.get("response") or action.get("thought") or ""
 
         # 4. Persist experience + cache + notify.
-        response = response or ""
+        response = response or "⚠ I couldn't process that request. Please try again."
         result = {
             "response": response,
             "steps": steps,
@@ -611,12 +611,19 @@ class Orchestrator:
         action = data.get("action", "respond")
         if action not in ("tool", "respond"):
             action = "respond"
+        thought = str(data.get("thought", ""))[:400]
+        response = data.get("response")
+        # When the LLM emits garbage (e.g. thought="json", response=null),
+        # don't propagate nonsense as the user-facing response.
+        if not response and thought.strip() in {"json", ""}:
+            thought = ""
+            response = "⚠ I couldn't process that request. Please try again."
         return {
-            "thought": str(data.get("thought", ""))[:400],
+            "thought": thought,
             "action": action,
             "tool": data.get("tool"),
             "args": data.get("args") if isinstance(data.get("args"), dict) else {},
-            "response": data.get("response"),
+            "response": response,
         }
 
     # ── context assembly & pruning (MODULE 4) ──────────────────────────────

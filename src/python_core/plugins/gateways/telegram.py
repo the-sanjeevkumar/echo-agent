@@ -44,7 +44,9 @@ MAX_MESSAGE = TELEGRAM_CHUNK  # Telegram hard limit is 4096
 COMMANDS = [
     {"command": "ask", "description": "Run a task"},
     {"command": "status", "description": "Session and model status"},
+    {"command": "model", "description": "Show or change the LLM model"},
     {"command": "reset", "description": "Clear this chat's session"},
+    {"command": "new", "description": "Clear this chat's session (alias for /reset)"},
     {"command": "whoami", "description": "Show sender and chat ids"},
     {"command": "activation", "description": "Toggle mention requirement in a group"},
     {"command": "help", "description": "List commands"},
@@ -81,6 +83,7 @@ class TelegramGateway(GatewayInterface):
         self._bot_id: int | None = None
         self._bot_username = ""
         self._activation: dict[str, bool] = {}  # chat_id → require mention
+        self._reaction_messages: dict[str, dict[str, Any]] = {}
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def start(self, ctx: KernelContext) -> None:
@@ -283,6 +286,19 @@ class TelegramGateway(GatewayInterface):
             chat_type="dm" if is_private else "group",
             chat_id=chat_id,
         )
+        # React with eyes to show we received the message and are working on it.
+        message_id = str(message.get("message_id") or "")
+        if message_id:
+            self._reaction_messages[chat_id] = {"chat_id": chat_id, "message_id": int(message_id)}
+            try:
+                await self._api(
+                    "setMessageReaction",
+                    chat_id=chat_id,
+                    message_id=int(message_id),
+                    reaction=[{"type": "emoji", "emoji": "👀"}],
+                )
+            except Exception:  # noqa: BLE001 — reaction is cosmetic
+                logger.debug("telegram eyes reaction failed", exc_info=True)
 
     def _admit(
         self,
@@ -354,48 +370,61 @@ class TelegramGateway(GatewayInterface):
             is_private=is_private, chat_id=chat_id, sender_id=sender_id, username=username
         )
 
-        if command in {"start", "help"}:
-            if not admission.allowed:
-                await self._notify_denied(admission, chat_id, sender_id, is_private)
-            else:
+        info_commands = {"start", "help", "whoami", "status", "model", "reset", "new"}
+        if command in info_commands:
+            # Info/session commands work without pairing in DMs.
+            if command in {"start", "help"}:
                 greeting = "echo-agent online." if command == "start" else self.help_text("Telegram")
                 await self.send_reply(chat_id, greeting)
-            return
-
-        if command == "whoami":
-            await self.send_reply(
-                chat_id,
-                f"user_id: {sender_id}\nusername: @{username or '—'}\n"
-                f"chat_id: {chat_id}\nchat_type: {chat_type}",
-            )
-            return
+                return
+            if command == "whoami":
+                await self.send_reply(
+                    chat_id,
+                    f"user_id: {sender_id}\nusername: @{username or '—'}\n"
+                    f"chat_id: {chat_id}\nchat_type: {chat_type}",
+                )
+                return
+            session_id = self._session_id(chat_id, chat_type, message)
+            if command == "status":
+                status = await self._bus.request(
+                    "session:status", {"session_id": session_id}, timeout=5.0
+                ) if self._bus is not None else None
+                status = status or {}
+                await self.send_reply(
+                    chat_id,
+                    f"session: {session_id}\n"
+                    f"messages: {status.get('messages', '?')}\n"
+                    f"model: {getattr(self.config, 'llm_model', '?')}\n"
+                    f"dm policy: {self.config.telegram_dm_policy}\n"
+                    f"group policy: {self.config.telegram_group_policy}",
+                )
+                return
+            if command == "model":
+                if not args:
+                    await self.send_reply(
+                        chat_id,
+                        f"current model: {getattr(self.config, 'llm_model', '?')}\n"
+                        f"usage: /model <new-model-name>",
+                    )
+                    return
+                self.config.llm_model = args.strip()
+                await self.send_reply(
+                    chat_id,
+                    f"✅ model changed to: {self.config.llm_model}\n"
+                    f"Next request will use this model.",
+                )
+                return
+            if command in {"reset", "new"}:
+                if self._bus is not None:
+                    await self._bus.emit("session:reset", {"session_id": session_id}, source="telegram")
+                await self.send_reply(chat_id, "🧹 session cleared for this chat.")
+                return
 
         if not admission.allowed:
             await self._notify_denied(admission, chat_id, sender_id, is_private)
             return
 
         session_id = self._session_id(chat_id, chat_type, message)
-
-        if command == "status":
-            status = await self._bus.request(
-                "session:status", {"session_id": session_id}, timeout=5.0
-            ) if self._bus is not None else None
-            status = status or {}
-            await self.send_reply(
-                chat_id,
-                f"session: {session_id}\n"
-                f"messages: {status.get('messages', '?')}\n"
-                f"model: {getattr(self.config, 'llm_model', '?')}\n"
-                f"dm policy: {self.config.telegram_dm_policy}\n"
-                f"group policy: {self.config.telegram_group_policy}",
-            )
-            return
-
-        if command in {"reset", "new"}:
-            if self._bus is not None:
-                await self._bus.emit("session:reset", {"session_id": session_id}, source="telegram")
-            await self.send_reply(chat_id, "🧹 session cleared for this chat.")
-            return
 
         if command == "activation":
             if is_private:
@@ -522,6 +551,22 @@ class TelegramGateway(GatewayInterface):
 
     async def send_typing(self, channel_id: str) -> None:
         await self._api("sendChatAction", chat_id=channel_id, action="typing")
+
+    async def _on_task_completed(self, channel_id: str, response: str, *, ok: bool) -> None:
+        """React ✅ on success, ❌ on failure, and clear the stored message info."""
+        info = self._reaction_messages.pop(channel_id, None)
+        if info is None:
+            return
+        emoji = "✅" if ok else "❌"
+        try:
+            await self._api(
+                "setMessageReaction",
+                chat_id=info["chat_id"],
+                message_id=info["message_id"],
+                reaction=[{"type": "emoji", "emoji": emoji}],
+            )
+        except Exception:  # noqa: BLE001 — reaction is cosmetic
+            logger.debug("telegram completion reaction failed", exc_info=True)
 
     # ── offset persistence ────────────────────────────────────────────────
     def _load_offset(self) -> int:
