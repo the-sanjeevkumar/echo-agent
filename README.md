@@ -33,29 +33,32 @@ features can be deleted, replaced, or hot-swapped without touching the kernel.
 ## Quick start
 
 ```bash
-git clone <your-fork> echo-agent
-cd echo-agent
-uv sync                 # core deps (Telegram works out of the box)
-uv sync --extra discord # optional Discord support
-uv run pytest tests/ -p no:cacheprovider   # 151 passed
+curl -fsSL https://raw.githubusercontent.com/the-sanjeevkumar/echo-agent/main/install.sh | bash
+echo-agent setup        # OpenClaw-style wizard (auto-runs on first TTY install)
+echo-agent agent        # start the agent (alias of `start`)
 ```
+
+No clone and no `uv sync` — the installer puts echo-agent in an isolated uv
+tool environment and adds it to your PATH. Re-running the one-liner upgrades
+in place.
 
 Run a one-shot task:
 
 ```bash
-uv run echo-agent run "list the files in this repo"
+echo-agent run "list the files in this repo"
 ```
 
 Start the daemon (manifest server + gateways + REPL):
 
 ```bash
-uv run echo-agent start
+echo-agent agent
 # or headless
-uv run echo-agent start --headless
+echo-agent agent --headless
 ```
 
 Without an LLM server the kernel still boots; the provider simply reports
-connection failures.
+connection failures. Bare `echo-agent` runs the wizard on first use, then
+prints help + daemon status.
 
 ---
 
@@ -163,14 +166,17 @@ Data layout:
 
 | Command | Effect |
 |---|---|
+| `echo-agent setup` / `onboard` | Interactive first-run wizard (`--quick`, `--reset`, non-interactive flags). |
+| `echo-agent agent [--headless]` | Alias of `start`: foreground daemon (REPL unless headless). |
+| `echo-agent start [--headless]` | Foreground daemon (kept for backward compatibility). |
+| `echo-agent doctor [--probe]` | Read-only health check with fix hints. |
 | `echo-agent run "task"` | One-shot task through the ReAct loop. |
-| `echo-agent start [--headless]` | Foreground daemon (REPL unless headless). |
 | `echo-agent gateway start\|stop\|restart\|status` | Manage the background daemon. |
 | `echo-agent status` / `stop` / `restart` | Top-level daemon shortcuts. |
 | `echo-agent skills add <url\|path>` | Ingest a skill repository. |
 | `echo-agent tools` | List builtin tools. |
 | `echo-agent plugins` | Dry manifest of builtin plugins. |
-| `echo-agent channels list` | Show channel status. |
+| `echo-agent channels list` | Show channel status (`channels` is an alias of `gateway`). |
 | `echo-agent channels add --channel <telegram\|discord> [--token ...]` | Add/configure a channel. |
 | `echo-agent channels remove --channel <telegram\|discord>` | Remove a channel token. |
 | `echo-agent channels test --channel <telegram\|discord>` | Validate a bot token. |
@@ -183,6 +189,70 @@ Data layout:
 | `echo-agent version` | Print version. |
 
 Global flags: `--config path/to/config.toml`, `--verbose/-v`.
+
+---
+
+## Setup, doctor, uninstall
+
+### `echo-agent setup`
+
+An OpenClaw-style wizard: banner, numbered menus, safe defaults, and probes.
+It auto-runs on the first interactive use of `agent`/`start`/`run`, or on bare
+`echo-agent` when no setup marker exists. Non-interactive runs get one hint line
+and boot with defaults.
+
+- **QuickStart**: LLM source, optional Telegram/Discord tokens, safe access rules.
+- **Advanced**: custom base URL/model/key, data dir, manifest port, context
+  budget, web allow/block lists, explicit sender allowlists.
+- Local LLM endpoints (Ollama `:11434`, LM Studio `:1234`, llama.cpp `:8080`)
+  are probed with a short timeout; tokens are checked with `getpass` and never
+  echoed or written to `install.json`.
+- Config is merged into the existing `config.toml` (unknown keys survive),
+  written atomically with mode `0600`, and `<data_dir>/.setup-complete` is
+  created. Ctrl-C stages nothing.
+
+```bash
+echo-agent setup --quick
+echo-agent setup --llm-base-url http://127.0.0.1:11434/v1 --llm-model llama3.1 --yes
+echo-agent setup --reset --data-dir /srv/echo --port 8791
+```
+
+### `echo-agent doctor`
+
+Read-only checks with ✓/✗/! and one-line fix hints: install metadata/version,
+entry point on PATH, config parse, data-dir writability, pidfile vs live
+process, manifest port, LLM endpoint, gateway tokens, and browser binaries.
+Only hard failures return a non-zero exit code. `--probe` enables network
+checks; browser binaries are never installed or deleted by doctor.
+
+### `echo-uninstall`
+
+Removes everything echo-agent owns, with one `y/N` confirmation (default N).
+There is also a standalone `uninstall.sh` that delegates to it when installed
+and falls back to bash cleanup when the install is broken.
+
+```bash
+echo-uninstall --dry-run            # exact plan: every path and command
+echo-uninstall --yes                # no prompts
+echo-uninstall --yes --keep-data    # remove the program, keep ~/.echo_agent
+echo-uninstall --verbose
+```
+
+Safety rails: only the resolved data root, echo-named uv shims/tool env,
+`# >>> echo-agent >>>` rc blocks, and explicitly owned browser paths may be
+deleted. It refuses an empty `$HOME`, `$HOME` itself, `/`, or any path outside
+`$HOME` (symlink escapes included). It never removes uv, Python, git, or system
+packages. A second run reports "nothing to do".
+
+| Artifact | Removed by default? | Notes |
+|---|---|---|
+| `~/.echo_agent/config.toml`, `.setup-complete`, `install.json` | ✓ | unless `--keep-data` |
+| `~/.echo_agent/sessions.json`, `memory/`, `skills/` | ✓ | all local state |
+| `~/.echo_agent/gateways/`, logs, pidfile | ✓ | daemon is stopped first |
+| uv tool env + `echo-agent` / `echo-uninstall` shims | ✓ | via `uv tool uninstall` |
+| `~/.bashrc` / `.zshrc` / `.profile` marker block | ✓ | surrounding lines untouched |
+| Scrapling/Playwright/Camoufox browser caches | only with `browsers-owned.json` | shared caches are kept by default |
+| uv, Python, git, system packages | ✗ | never touched |
 
 ---
 
@@ -294,6 +364,10 @@ echo-agent/
 │   ├── cpp_memory/index.cpp
 │   └── python_core/
 │       ├── main.py               # CLI + kernel bootstrap
+│       ├── setup_wizard.py        # first-run onboarding
+│       ├── doctor.py              # read-only health checks
+│       ├── uninstall.py           # safety-railed total uninstall
+│       ├── lifecycle.py           # shared paths, metadata, config merge
 │       ├── orchestrator.py        # ReAct loop, pruning, cache, sessions
 │       ├── core/                 # event_bus, plugin_manager, interfaces, config
 │       └── plugins/
@@ -303,7 +377,25 @@ echo-agent/
 │           ├── llm/
 │           ├── web/
 │           └── gateways/         # base, pairing, discord, telegram
-└── tests/                        # 151-test full-kernel suite
+├── install.sh / uninstall.sh     # one-line install + standalone cleanup
+├── scripts/lint.sh               # shellcheck + ruff + pytest
+└── tests/                        # 175-test full-kernel suite
+```
+
+---
+
+## Development
+
+Clone the repo when you want to hack on the agent itself:
+
+```bash
+git clone https://github.com/the-sanjeevkumar/echo-agent.git
+cd echo-agent
+uv sync                     # core deps (Telegram works out of the box)
+uv sync --extra discord     # optional Discord support
+uv run echo-agent run "list the files in this repo"
+uv run pytest tests/ -q -p no:cacheprovider
+bash scripts/lint.sh        # shellcheck (via uvx if needed) + ruff + pytest
 ```
 
 ---
@@ -325,7 +417,7 @@ Extras: `native`, `discord`, `telegram` (empty: Telegram uses plain `httpx`),
 
 ```bash
 uv run pytest tests/ -q -p no:cacheprovider
-# 151 passed
+# 175 passed
 ```
 
 The full-kernel fixture builds the *real* system (only the LLM is swapped for

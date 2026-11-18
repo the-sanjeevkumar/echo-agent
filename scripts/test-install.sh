@@ -22,7 +22,12 @@ export UV_TOOL_BIN_DIR="$TMP/bin"
 export ECHO_NO_SETUP=1
 
 printf '== install ==\n'
-bash install.sh
+if [ "${ECHO_INSTALL_LOCAL:-0}" = "1" ]; then
+    # Verify the working tree end-to-end before changes are pushed to GitHub.
+    uv tool install --force "$ROOT"
+else
+    bash install.sh
+fi
 [ -x "$UV_TOOL_BIN_DIR/echo-agent" ] || { printf 'FAIL: echo-agent shim missing\n' >&2; exit 1; }
 "$UV_TOOL_BIN_DIR/echo-agent" version
 
