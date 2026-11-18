@@ -85,6 +85,7 @@ class DiscordGateway(GatewayInterface):
         self._typing_enabled = bool(ctx.config.gateway_typing)
         self._running = True
         self._task = asyncio.create_task(self._run(), name="echo-discord")
+        self.start_notification_pump()
         ctx.logger.info("discord gateway connecting")
 
     async def stop(self) -> None:

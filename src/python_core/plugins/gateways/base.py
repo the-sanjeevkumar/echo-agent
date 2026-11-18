@@ -208,6 +208,7 @@ class GatewayInterface(ABC):
         self._typing_tasks: dict[str, asyncio.Task[None]] = {}
         self._typing_enabled = False
         self._typing_interval = 4.5
+        self._notification_task: asyncio.Task[None] | None = None
 
     # ── lifecycle (ABC contract mirrors Plugin Protocol) ───────────────────
     @abstractmethod
@@ -271,6 +272,52 @@ class GatewayInterface(ABC):
             task.cancel()
         self._typing_tasks.clear()
         self._pending.clear()
+        if self._notification_task is not None:
+            self._notification_task.cancel()
+            self._notification_task = None
+
+    # ── approval notifications (OpenClaw ``pairing approve --notify``) ───────
+    def start_notification_pump(self, interval: float = 15.0) -> None:
+        """Poll the pairing store for confirmations queued by the CLI.
+
+        The CLI runs in a separate process, so approvals with ``--notify`` are
+        written to the shared store and delivered by the live gateway.
+        """
+        if self._notification_task is not None and not self._notification_task.done():
+            return
+        self._notification_task = asyncio.create_task(
+            self._notification_loop(interval),
+            name=f"echo-pairing-notify-{self.name}",
+        )
+
+    async def _notification_loop(self, interval: float) -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await self.flush_pairing_notifications()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # never let the pump kill the gateway
+            logger.debug("pairing notification pump failed", exc_info=True)
+
+    async def flush_pairing_notifications(self) -> None:
+        """Deliver every queued approval confirmation for this gateway."""
+        store = self.pairing
+        if store is None:
+            return
+        for notice in store.take_notifications(self.name):
+            chat_id = str(notice.get("chat_id") or notice.get("sender_id") or "").strip()
+            if not chat_id:
+                continue
+            try:
+                await self.send_reply(chat_id, self.approval_notice(self.name.title()))
+            except Exception:  # confirmation is cosmetic
+                logger.debug("pairing confirmation delivery failed for %s", chat_id, exc_info=True)
+
+    @staticmethod
+    def approval_notice(platform: str = "") -> str:
+        suffix = f" on {platform}" if platform else ""
+        return f"✅ Pairing approved{suffix}. You can now chat with echo-agent."
 
     def emit_task(
         self,

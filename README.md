@@ -175,8 +175,9 @@ Data layout:
 | `echo-agent channels remove --channel <telegram\|discord>` | Remove a channel token. |
 | `echo-agent channels test --channel <telegram\|discord>` | Validate a bot token. |
 | `echo-agent channels status [--probe]` | Status, optionally probing tokens. |
-| `echo-agent pairing list [telegram\|discord] [--json]` | Pending/approved DM senders. |
-| `echo-agent pairing approve <channel> <code>` | Approve a DM pairing code. |
+| `echo-agent pairing list [telegram\|discord] [--json]` | Pending/approved DM senders (`requests` mirrors OpenClaw's JSON). |
+| `echo-agent pairing approve <channel> <code> [--notify]` | Approve a DM pairing code; `--notify` messages the requester. |
+| `echo-agent pairing dismiss <channel> <code>` | Drop a pending code without approving (sender may re-request). |
 | `echo-agent pairing revoke <channel> <sender_id>` | Revoke an approved sender. |
 | `echo-agent bus` | Launch the Rust `echo-bus`. |
 | `echo-agent version` | Print version. |
@@ -213,12 +214,22 @@ indicators, and per-chat session keys. Platform adapters stay thin.
 - **DMs**: `pairing` by default. Unknown senders receive an 8-character code
   (no ambiguous `0/O/1/I`) and their message is **not** processed.
 - **Groups/guilds**: `allowlist` by default; empty allowlist means closed.
+- Codes are 8 uppercase characters (no ambiguous `0/O/1/I`), expire after one
+  hour, are single-use, and are capped at 3 pending requests per channel. The
+  bot replies only when a request is first created, so strangers cannot spam it.
+  Repeat requests refresh `last_seen_at` without rotating the code.
+- Approval grants **DM access only** — group/guild access stays config-driven.
 - Approve from the host while the daemon keeps running:
   ```bash
-  uv run echo-agent pairing list telegram
-  uv run echo-agent pairing approve telegram ABCD2345
+  uv run echo-agent pairing list telegram --json
+  uv run echo-agent pairing approve telegram ABCD2345 --notify
+  uv run echo-agent pairing dismiss telegram ABCD2345
   uv run echo-agent pairing revoke telegram 123456789
   ```
+  `--notify` queues a confirmation in the shared pairing store; the live
+  gateway delivers it to the requester's DM (and is drained once).
+  `dismiss` drops a pending request without approving it; the sender may ask
+  again and will receive a fresh code.
 
 ### Sessions
 

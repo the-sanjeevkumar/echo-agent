@@ -35,7 +35,12 @@ def new_pairing_code() -> str:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"version": 1, "channels": {}}
+    return {"version": 1, "channels": {}, "notifications": []}
+
+
+def _new_request_id() -> str:
+    """Stable, opaque id for a pairing request (shown by ``pairing list --json``)."""
+    return secrets.token_hex(8)
 
 
 class PairingStore:
@@ -72,6 +77,8 @@ class PairingStore:
                 continue
             entry.setdefault("pending", {})
             entry.setdefault("approved", {})
+        if not isinstance(raw.get("notifications"), list):
+            raw["notifications"] = []
         return raw
 
     def _write(self, state: dict[str, Any]) -> None:
@@ -133,42 +140,73 @@ class PairingStore:
 
         Returns a dict with ``status`` ∈ ``created | pending | approved | full``.
         Only ``created`` should trigger a chat message, so a stranger cannot
-        spam the bot (or the operator) by messaging repeatedly.
+        spam the bot (or the operator) by messaging repeatedly. A repeat request
+        refreshes ``last_seen_at`` but keeps the same single-use code.
         """
         sender = self._norm(sender_id)
         now = self._clock()
         with self._lock:
             state = self._read()
             entry = self._channel(state, channel)
-            self._purge(entry)
+            purged = self._purge(entry)
 
             if sender in entry["approved"]:
+                if purged:
+                    self._write(state)
                 return {"status": "approved", "sender_id": sender}
 
             pending = entry["pending"]
             existing = pending.get(sender)
             if isinstance(existing, dict):
+                created_at = float(existing.get("created_at", now))
+                existing["last_seen_at"] = now
+                if username:
+                    existing["username"] = username
+                if chat_id:
+                    existing["chat_id"] = str(chat_id)
+                self._write(state)
                 return {
                     "status": "pending",
                     "sender_id": sender,
+                    "id": str(existing.get("id") or ""),
                     "code": str(existing.get("code", "")),
-                    "expires_in": max(0, int(self.ttl - (now - float(existing.get("created_at", now))))),
+                    "created_at": created_at,
+                    "last_seen_at": now,
+                    "expires_in": max(0, int(self.ttl - (now - created_at))),
                 }
 
             if len(pending) >= self.max_pending:
+                if purged:
+                    self._write(state)
                 return {"status": "full", "sender_id": sender}
 
             code = new_pairing_code()
+            request_id = _new_request_id()
             pending[sender] = {
+                "id": request_id,
                 "code": code,
                 "created_at": now,
+                "last_seen_at": now,
                 "username": username,
                 "chat_id": str(chat_id),
             }
             self._write(state)
-            return {"status": "created", "sender_id": sender, "code": code, "expires_in": int(self.ttl)}
+            return {
+                "status": "created",
+                "sender_id": sender,
+                "id": request_id,
+                "code": code,
+                "created_at": now,
+                "last_seen_at": now,
+                "expires_in": int(self.ttl),
+            }
 
-    def approve(self, channel: str, code: str) -> dict[str, Any] | None:
+    def approve(
+        self, channel: str, code: str, *, notify: bool = False
+    ) -> dict[str, Any] | None:
+        """Approve a pending code once. With *notify*, queue a confirmation
+        that the running gateway will deliver to the requester's DM.
+        """
         wanted = (code or "").strip().upper()
         if not wanted:
             return None
@@ -181,21 +219,86 @@ class PairingStore:
                 if str(item.get("code", "")).upper() != wanted:
                     continue
                 entry["pending"].pop(sender, None)
+                chat_id = str(item.get("chat_id") or "")
+                deliver = bool(notify and chat_id)
                 entry["approved"][sender] = {
                     "approved_at": now,
                     "username": item.get("username", ""),
-                    "chat_id": item.get("chat_id", ""),
+                    "chat_id": chat_id,
+                    "request_id": str(item.get("id") or ""),
+                    "notified": deliver,
                 }
+                if deliver:
+                    state.setdefault("notifications", []).append({
+                        "channel": channel,
+                        "sender_id": sender,
+                        "chat_id": chat_id,
+                        "created_at": now,
+                    })
                 self._write(state)
                 return {
                     "channel": channel,
                     "sender_id": sender,
+                    "username": item.get("username", ""),
+                    "chat_id": chat_id,
+                    "notified": deliver,
+                }
+            if changed:
+                self._write(state)
+            return None
+
+    def dismiss(self, channel: str, code: str) -> dict[str, Any] | None:
+        """Drop a pending request without approving it (not a permanent block:
+        the sender may request again). Codes remain single-use either way.
+        """
+        wanted = (code or "").strip().upper()
+        if not wanted:
+            return None
+        with self._lock:
+            state = self._read()
+            entry = state.get("channels", {}).get(channel)
+            if not isinstance(entry, dict):
+                return None
+            changed = self._purge(entry)
+            for sender, item in list(entry.get("pending", {}).items()):
+                if str(item.get("code", "")).upper() != wanted:
+                    continue
+                entry["pending"].pop(sender, None)
+                self._write(state)
+                return {
+                    "channel": channel,
+                    "sender_id": sender,
+                    "code": wanted,
                     "username": item.get("username", ""),
                     "chat_id": item.get("chat_id", ""),
                 }
             if changed:
                 self._write(state)
             return None
+
+    def take_notifications(self, channel: str | None = None) -> list[dict[str, Any]]:
+        """Drain queued approval confirmations for the running gateway."""
+        with self._lock:
+            state = self._read()
+            items = state.get("notifications") or []
+            if not isinstance(items, list) or not items:
+                return []
+            matched = [
+                item for item in items
+                if isinstance(item, dict)
+                and (channel is None or item.get("channel") == channel)
+            ]
+            if not matched:
+                return []
+            state["notifications"] = [
+                item for item in items
+                if not (
+                    isinstance(item, dict)
+                    and (channel is None or item.get("channel") == channel)
+                )
+            ]
+            self._write(state)
+            return matched
 
     def revoke(self, channel: str, sender_id: str | int) -> bool:
         sender = self._norm(sender_id)
@@ -226,12 +329,16 @@ class PairingStore:
                     age = max(0.0, now - float(item.get("created_at", now)))
                     if age >= self.ttl:
                         continue
+                    created_at = float(item.get("created_at", now))
                     out.append({
                         "channel": name,
                         "sender_id": sender,
+                        "id": item.get("id", ""),
                         "code": item.get("code", ""),
                         "username": item.get("username", ""),
                         "chat_id": item.get("chat_id", ""),
+                        "created_at": created_at,
+                        "last_seen_at": float(item.get("last_seen_at", created_at)),
                         "age_seconds": int(age),
                         "expires_in": max(0, int(self.ttl - age)),
                     })
@@ -252,5 +359,7 @@ class PairingStore:
                         "sender_id": sender,
                         "username": (item or {}).get("username", "") if isinstance(item, dict) else "",
                         "chat_id": (item or {}).get("chat_id", "") if isinstance(item, dict) else "",
+                        "approved_at": float((item or {}).get("approved_at", 0)) if isinstance(item, dict) else 0.0,
+                        "request_id": (item or {}).get("request_id", "") if isinstance(item, dict) else "",
                     })
             return out

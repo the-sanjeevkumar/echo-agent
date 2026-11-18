@@ -248,6 +248,94 @@ def test_pairing_store_expiry_and_cap(tmp_path) -> None:
     assert again["code"] != first["code"]
 
 
+def test_pairing_request_metadata_and_last_seen(tmp_path) -> None:
+    now = [1000.0]
+    store = PairingStore(tmp_path / "pairing.json", ttl=60, clock=lambda: now[0])
+    created = store.request("telegram", 7, username="alice", chat_id="77")
+    assert created["status"] == "created"
+    assert created["id"]
+    assert created["created_at"] == 1000.0
+    assert created["last_seen_at"] == 1000.0
+
+    pending = store.list_pending("telegram")
+    assert pending[0]["id"] == created["id"]
+    assert pending[0]["code"] == created["code"]
+
+    now[0] += 5
+    repeat = store.request("telegram", 7, username="alice")
+    assert repeat["status"] == "pending"
+    assert repeat["code"] == created["code"]  # single-use code is not rotated
+    assert repeat["last_seen_at"] == 1005.0
+    assert store.list_pending("telegram")[0]["last_seen_at"] == 1005.0
+    assert store.list_pending("telegram")[0]["id"] == created["id"]
+
+
+def test_pairing_dismiss_and_notify(tmp_path) -> None:
+    store = PairingStore(tmp_path / "pairing.json")
+    first = store.request("discord", 9, username="bob", chat_id="99")
+    assert store.dismiss("discord", "NOPE") is None
+    assert store.dismiss("discord", first["code"].lower())["sender_id"] == "9"
+    assert store.list_pending("discord") == []
+    assert store.is_approved("discord", 9) is False  # dismiss is not approval
+
+    again = store.request("discord", 9, username="bob", chat_id="99")
+    assert again["status"] == "created"
+    assert again["code"] != first["code"]
+
+    result = store.approve("discord", again["code"], notify=True)
+    assert result is not None and result["notified"] is True
+    assert store.take_notifications("telegram") == []
+    notices = store.take_notifications("discord")
+    assert len(notices) == 1
+    assert notices[0]["chat_id"] == "99"
+    assert notices[0]["sender_id"] == "9"
+    assert store.take_notifications("discord") == []  # drained once
+    assert store.list_approved("discord")[0]["request_id"] == again["id"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_delivers_pairing_confirmation(tmp_path) -> None:
+    ctx = make_ctx(tmp_path)
+    gateway = configured_telegram(ctx)
+    store = ctx.service("pairing")
+    created = store.request("telegram", 42, username="alice", chat_id="42")
+    store.approve("telegram", created["code"], notify=True)
+
+    await gateway.flush_pairing_notifications()
+    assert any("Pairing approved" in text for _, text in gateway.replies)
+    assert gateway.replies[-1][0] == "42"
+
+    await gateway.flush_pairing_notifications()
+    assert len(gateway.replies) == 1  # no duplicate confirmation
+
+
+def test_pairing_cli_dismiss_and_notify(tmp_path, capsys) -> None:
+    from python_core.main import _cmd_pairing
+
+    config = EchoConfig(data_dir=tmp_path / "data")
+    store = PairingStore(config.data_dir / "gateways" / "pairing.json")
+    pending = store.request("telegram", 55, username="carol", chat_id="55")
+
+    rc = _cmd_pairing(
+        SimpleNamespace(pairing_command="dismiss", channel="telegram", code=pending["code"]),
+        config,
+    )
+    assert rc == 0
+    assert "dismissed" in capsys.readouterr().out
+    assert store.list_pending("telegram") == []
+
+    pending = store.request("telegram", 55, username="carol", chat_id="55")
+    rc = _cmd_pairing(
+        SimpleNamespace(
+            pairing_command="approve", channel="telegram", code=pending["code"], notify=True
+        ),
+        config,
+    )
+    assert rc == 0
+    assert "requester notified" in capsys.readouterr().out
+    assert len(store.take_notifications("telegram")) == 1
+
+
 # ── Telegram ────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_telegram_dm_pairing_then_approval(tmp_path) -> None:

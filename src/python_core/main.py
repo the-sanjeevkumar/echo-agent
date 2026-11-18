@@ -451,14 +451,25 @@ def _pairing_store(config: EchoConfig) -> PairingStore:
 
 
 def _cmd_pairing(args: argparse.Namespace, config: EchoConfig) -> int:
-    """Approve DM pairing requests from a running (or stopped) gateway."""
+    """List/approve/dismiss/revoke DM pairing requests (OpenClaw-style)."""
     store = _pairing_store(config)
     action = args.pairing_command
     if action == "list":
         pending = store.list_pending(args.channel)
         approved = store.list_approved(args.channel)
         if args.as_json:
-            print(json.dumps({"pending": pending, "approved": approved}, indent=2, ensure_ascii=False))
+            # ``requests`` mirrors OpenClaw's pairing JSON; ``pending``/``approved``
+            # are kept for older scripts.
+            print(json.dumps(
+                {
+                    "channel": args.channel or "",
+                    "requests": pending,
+                    "pending": pending,
+                    "approved": approved,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ))
             return 0
         if not pending and not approved:
             print("no pending or approved pairings")
@@ -479,12 +490,32 @@ def _cmd_pairing(args: argparse.Namespace, config: EchoConfig) -> int:
         return 0
 
     if action == "approve":
-        result = store.approve(args.channel, args.code)
+        result = store.approve(args.channel, args.code, notify=bool(getattr(args, "notify", False)))
         if result is None:
-            print(f"no pending pairing with code {args.code!r} on {args.channel}", file=sys.stderr)
+            print(
+                f"no pending pairing with code {args.code!r} on {args.channel}. "
+                f"Run `echo-agent pairing list {args.channel}` to see pending codes.",
+                file=sys.stderr,
+            )
             return 1
         who = f"@{result['username']}" if result["username"] else result["sender_id"]
-        print(f"approved {args.channel} user {who} ({result['sender_id']})")
+        note = (
+            " (requester notified)" if result.get("notified")
+            else " (use --notify to message the requester)"
+        )
+        print(f"approved {args.channel} user {who} ({result['sender_id']}){note}")
+        return 0
+
+    if action == "dismiss":
+        removed = store.dismiss(args.channel, args.code)
+        if removed is None:
+            print(
+                f"no pending pairing with code {args.code!r} on {args.channel}. "
+                f"Run `echo-agent pairing list {args.channel}` to see pending codes.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"dismissed {args.channel} pairing {args.code} for user {removed['sender_id']}")
         return 0
 
     if action == "revoke":
@@ -918,6 +949,12 @@ def cli(argv: list[str] | None = None) -> int:
     pairing_approve = pairing_sub.add_parser("approve", help="approve a pending code")
     pairing_approve.add_argument("channel", choices=["telegram", "discord"])
     pairing_approve.add_argument("code")
+    pairing_approve.add_argument(
+        "--notify", action="store_true", help="send a confirmation to the requester's DM"
+    )
+    pairing_dismiss = pairing_sub.add_parser("dismiss", help="dismiss a pending code without approving")
+    pairing_dismiss.add_argument("channel", choices=["telegram", "discord"])
+    pairing_dismiss.add_argument("code")
     pairing_revoke = pairing_sub.add_parser("revoke", help="revoke an approved sender")
     pairing_revoke.add_argument("channel", choices=["telegram", "discord"])
     pairing_revoke.add_argument("sender_id")

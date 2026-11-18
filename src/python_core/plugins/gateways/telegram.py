@@ -99,6 +99,7 @@ class TelegramGateway(GatewayInterface):
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(65.0, connect=15.0))
         self._running = True
         self._task = asyncio.create_task(self._run(), name="echo-telegram")
+        self.start_notification_pump()
         ctx.logger.info("telegram gateway polling")
 
     def _configure(self, ctx: KernelContext) -> None:
