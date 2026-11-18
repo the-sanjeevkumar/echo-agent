@@ -29,6 +29,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -355,6 +356,8 @@ class SkillIngester:
         self._ctx: KernelContext | None = None
         self._bus: EventBus | None = None
         self._loaded_wrappers: dict[str, Any] = {}
+        # PHASE 4: synthesized procedure skills (name → one-line description).
+        self._synthesized: dict[str, str] = {}
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def start(self, ctx: KernelContext) -> None:
@@ -382,6 +385,7 @@ class SkillIngester:
         })
         # Persistence: re-register previously acquired skills (restart-safe).
         loaded = await self.load_installed()
+        self._load_synthesized_catalog()
         ctx.logger.info("skills plugin online (%d installed skill(s))", len(loaded))
 
     def stop(self) -> None:
@@ -578,6 +582,107 @@ class SkillIngester:
             registered.append(tool_name)
         return registered
 
+    # ── PHASE 4: synthesized procedure skills ─────────────────────────────
+    @staticmethod
+    def _render_skill_md(
+        name: str, when_to_use: str, steps: list[str], tool_sequence: list[str], pitfalls: list[str]
+    ) -> str:
+        def section(title: str, items: list[str]) -> str:
+            body = "\n".join(f"- {item}" for item in items) if items else "- (none recorded)"
+            return f"## {title}\n{body}\n"
+
+        return (
+            f"---\nname: {name}\ndescription: {when_to_use[:300]}\n"
+            f"origin: synthesized\n---\n\n"
+            f"# {name}\n\n"
+            f"## When to use\n{when_to_use}\n\n"
+            + section("Steps", steps)
+            + "\n"
+            + section("Tool sequence", tool_sequence)
+            + "\n"
+            + section("Pitfalls", pitfalls)
+        )
+
+    async def synthesize_skill(
+        self,
+        name: str,
+        *,
+        when_to_use: str,
+        steps: list[str] | None = None,
+        tool_sequence: list[str] | None = None,
+        pitfalls: list[str] | None = None,
+        patch: bool = False,
+    ) -> dict[str, Any]:
+        """Create or PATCH one procedural skill (SKILL.md) — never duplicate.
+
+        Uses the same skills directory as the existing loader so synthesized
+        procedures are restart-safe and visible in the next prompt.
+        """
+        safe = _sanitize_name(name)
+        skill_dir = self.config.resolved_skills_dir / safe
+        exists = skill_dir.is_dir() and (skill_dir / "SKILL.md").is_file()
+        if exists and not patch:
+            return {"ok": True, "created": False, "name": safe, "reason": "already exists"}
+
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        content = self._render_skill_md(
+            safe, when_to_use, steps or [], tool_sequence or [], pitfalls or []
+        )
+        tmp = skill_dir / "SKILL.md.tmp"
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, skill_dir / "SKILL.md")
+        meta_path = skill_dir / "metadata.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+        except (OSError, ValueError):
+            meta = {}
+        meta.update({
+            "name": safe,
+            "origin": "synthesized",
+            "description": when_to_use[:300],
+            "updated_at": time.time(),
+        })
+        meta.setdefault("created_at", meta["updated_at"])
+        meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._synthesized[safe] = when_to_use[:300]
+
+        if self._bus is not None:
+            self._bus.publish(
+                "skill:synthesized" if not exists else "skill:patched",
+                {"name": safe, "created": not exists}, source="skills"
+            )
+        return {
+            "ok": True,
+            "created": not exists,
+            "patched": exists,
+            "name": safe,
+            "path": str(skill_dir / "SKILL.md"),
+        }
+
+    def _load_synthesized_catalog(self) -> None:
+        skills_root = self.config.resolved_skills_dir
+        if not skills_root.is_dir():
+            return
+        for meta_path in sorted(skills_root.glob("*/metadata.json")):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if meta.get("origin") == "synthesized":
+                name = str(meta.get("name") or meta_path.parent.name)
+                self._synthesized[name] = str(meta.get("description", ""))[:300]
+
+    def catalog_block(self, *, limit: int = 20) -> str:
+        """Frozen SKILLS block injected into the next system prompt."""
+        if not self._synthesized:
+            return ""
+        items = sorted(self._synthesized.items())[:limit]
+        return (
+            "SKILLS (learned procedures available to you):\n"
+            + "\n".join(f"- {name}: {description}" for name, description in items)
+            + "\n"
+        )
+
     async def load_installed(self) -> list[str]:
         """Restart-safe: load every installed skill's wrapper from disk."""
         loaded: list[str] = []
@@ -587,6 +692,8 @@ class SkillIngester:
         for metadata_path in sorted(skills_root.glob("*/metadata.json")):
             try:
                 data = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if data.get("origin") == "synthesized":
+                    continue  # knowledge-only skills have no wrapper to hoist
                 loaded.extend(await self._load_wrapper(metadata_path.parent))
                 logger.info("skill reloaded from disk: %s", data.get("name"))
             except Exception:  # noqa: BLE001

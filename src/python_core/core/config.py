@@ -126,6 +126,14 @@ class EchoConfig:
     embedding_model_dir: str = ""      # default: <data_dir>/models/all-MiniLM-L6-v2
     enable_embeddings: bool = True     # off = hash-only deterministic fallback
 
+    # ── learning loop (PHASE 4) ────────────────────────────────────────────
+    learning_enabled: bool = True             # background post-turn review
+    review_debounce_seconds: float = 30.0     # min gap between reviews
+    review_max_chars: int = 2400              # hard cap on review material
+    review_llm_model: str = ""                # optional cheaper model; default = same API model
+    review_min_failure_count: int = 3         # recurring failures before patch proposal
+    auto_apply_if_tests_pass: bool = False    # code patches need chat approval by default
+
     def __post_init__(self) -> None:
         self.data_dir = Path(self.data_dir).expanduser()
         # Keep policy values in a known set; an invalid value must fail safe
@@ -314,6 +322,8 @@ class EchoConfig:
         for env_key, field_name in (
             ("ECHO_MEMORY_WRITE_APPROVAL", "memory_write_approval"),
             ("ECHO_ENABLE_EMBEDDINGS", "enable_embeddings"),
+            ("ECHO_LEARNING_ENABLED", "learning_enabled"),
+            ("ECHO_AUTO_APPLY_IF_TESTS_PASS", "auto_apply_if_tests_pass"),
         ):
             if env_key in os.environ:
                 values[field_name] = os.environ[env_key].strip().lower() in {"1", "true", "yes", "on"}

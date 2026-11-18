@@ -74,7 +74,7 @@ SYSTEM_TEMPLATE = (
     "Strategy: use tools for anything factual or mutating; prefer unified diffs over "
     "full files; keep 'thought' to one sentence.\n"
     "AVAILABLE TOOLS (JSON schema):\n{tools}\n"
-    "{user_profile}{memory_snapshot}{memory_block}RECENT CONTEXT:\n{working_memory}"
+    "{user_profile}{memory_snapshot}{skills_block}{memory_block}RECENT CONTEXT:\n{working_memory}"
     "\n\nMEMORY GUIDANCE:\n"
     "- The USER PROFILE and curated MEMORY snapshot above are injected into every "
     "prompt: use them. Identity survives /reset and restarts.\n"
@@ -492,6 +492,23 @@ class Orchestrator:
             )
             return result
 
+        # Code-patch approvals (owner-only chat command, Phase 4).
+        patch_parts = text.lstrip("/").strip().lower().split()
+        if patch_parts and patch_parts[0] == "patch" and len(patch_parts) <= 3:
+            result = await self._handle_patch_command(text, user_id=user_id, source=source, session_id=session_id)
+            self._finish(
+                text,
+                result,
+                reply_channel,
+                platform,
+                elapsed=time.monotonic() - started,
+                cached=False,
+                session_id=session_id,
+                user_id=user_id,
+                source=source,
+            )
+            return result
+
         # 1. Semantic cache (MODULE 4), scoped to this chat session.
         tool_names = [s["name"] for s in self.tools.schemas()]
         cached = self.cache.lookup(text, tool_names, scope=session_id)
@@ -683,6 +700,66 @@ class Orchestrator:
             "session_id": session_id,
         }
 
+    # ── code-patch approvals (/patch, owner-only, Phase 4) ────────────────
+    async def _handle_patch_command(
+        self,
+        text: str,
+        *,
+        user_id: str | None,
+        source: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """List / approve / reject sandbox-validated code patch proposals."""
+        services = getattr(self, "_ctx", None)
+        learning = services.service("learning") if services is not None else None
+        memory = self.memory
+        if learning is None or memory is None or not hasattr(memory, "profiles"):
+            return {
+                "response": "⚠ patch approvals are unavailable right now.",
+                "steps": [], "cached": False, "session_id": session_id,
+            }
+        key = memory.profiles.resolve_key(user_id or "", source)
+        if not memory.profiles.is_owner(key):
+            return {
+                "response": "⚠ patch approvals are owner-only.",
+                "steps": [], "cached": False, "session_id": session_id,
+            }
+        parts = text.strip().lower().split()
+        action = parts[1] if len(parts) > 1 else "list"
+        pend_id = parts[2] if len(parts) > 2 else ""
+        try:
+            if action == "list":
+                items = learning.pending_patches
+                if not items:
+                    return {
+                        "response": "no pending code patches.",
+                        "steps": [], "cached": False, "session_id": session_id,
+                    }
+                lines = [f"- {pid}: {item.get('target_file')}" for pid, item in items.items()]
+                return {
+                    "response": "Pending code patches:\n" + "\n".join(lines)
+                    + "\nApprove with /patch approve <id>",
+                    "steps": [], "cached": False, "session_id": session_id,
+                }
+            if action == "approve":
+                outcome = await learning.approve_patch(pend_id)
+                response = (
+                    f"🩹 Patch {pend_id} applied: {outcome.get('reason', 'ok')}"
+                    if outcome.get("ok") else f"⚠ {outcome.get('error', 'approval failed')}"
+                )
+            elif action == "reject":
+                outcome = learning.reject_patch(pend_id)
+                response = f"🗑 Patch {pend_id} rejected." if outcome.get("ok") else f"⚠ {outcome.get('error', 'reject failed')}"
+            else:
+                response = "usage: /patch [list|approve <id>|reject <id>]"
+        except Exception:  # noqa: BLE001
+            logger.exception("patch command failed")
+            return {
+                "response": "⚠ couldn't process the patch command.",
+                "steps": [], "cached": False, "session_id": session_id,
+            }
+        return {"response": response, "steps": [], "cached": False, "session_id": session_id}
+
     @staticmethod
     def _notify(on_event: ProgressCallback | None, event: dict[str, Any]) -> None:
         """Deliver a UI progress event; UI failures never affect the loop."""
@@ -717,6 +794,7 @@ class Orchestrator:
                 "session_id": session_id,
                 "user_id": user_id,
                 "source": source,
+                "steps": result.get("steps", []),
             },
             source="orchestrator",
         )
@@ -789,7 +867,7 @@ class Orchestrator:
         tools = json.dumps(self.tools.schemas(), separators=(",", ":"))
         # Working Memory (volatile) + Semantic recall (durable), if present.
         wm_block, recall_block = "", ""
-        profile_block, curated_block = "", ""
+        profile_block, curated_block, skills_block = "", "", ""
         mem = self.memory
         if mem is not None:
             try:
@@ -811,6 +889,10 @@ class Orchestrator:
                 curated = getattr(self, "_ctx", None) and self._ctx.service("curated_memory")
                 if curated is not None:
                     curated_block = curated.snapshot()
+                services = getattr(self, "_ctx", None)
+                skills = services.service("skills") if services is not None else None
+                if skills is not None and hasattr(skills, "catalog_block"):
+                    skills_block = skills.catalog_block()
             except Exception:  # noqa: BLE001
                 logger.exception("memory recall failed; continuing without it")
         system = SYSTEM_TEMPLATE.format(
@@ -819,6 +901,7 @@ class Orchestrator:
             working_memory=wm_block,
             user_profile=profile_block,
             memory_snapshot=curated_block,
+            skills_block=skills_block,
         )
 
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]

@@ -475,6 +475,51 @@ class SemanticMemory:
         out.sort(key=lambda hit: hit["score"], reverse=True)
         return out[:k]
 
+    # ── PHASE 4: pattern dedup / decay ────────────────────────────────────
+    def find_similar(self, text: str, *, threshold: float = 0.90) -> dict[str, Any] | None:
+        """Find a consolidated pattern with cosine >= threshold (pure local)."""
+        emb = self.embed(text)
+        best_id, best_sim = None, threshold
+        for doc_id, doc in self._docs.items():
+            if (doc.get("metadata") or {}).get("origin") != "consolidation":
+                continue
+            sim = cosine(emb, self.embed(doc.get("text", "")))
+            if sim >= best_sim:
+                best_id, best_sim = doc_id, sim
+        return self._docs[best_id] if best_id is not None else None
+
+    def reinforce(self, doc_id: str, salience: float = 0.5) -> None:
+        """Bump salience/timestamp of an existing pattern instead of duplicating."""
+        doc = self._docs.get(doc_id)
+        if doc is None:
+            return
+        meta = doc.setdefault("metadata", {})
+        meta["salience"] = round(max(float(meta.get("salience", 0.0)), salience), 4)
+        meta["ts"] = time.time()
+        meta["hits"] = int(meta.get("hits", 0)) + 1
+        self._save_docs()
+
+    def decay_patterns(
+        self, *, decay_per_day: float = 0.02, min_salience: float = 0.1, max_age_days: float = 60.0
+    ) -> int:
+        """Decay stale consolidated patterns; evict weak, old ones."""
+        now = time.time()
+        removed = 0
+        for doc_id, doc in list(self._docs.items()):
+            meta = doc.get("metadata") or {}
+            if meta.get("origin") != "consolidation":
+                continue
+            age_days = max(0.0, (now - float(meta.get("ts") or now)) / 86400.0)
+            salience = float(meta.get("salience", 0.5)) * ((1.0 - decay_per_day) ** age_days)
+            if age_days > max_age_days and salience < min_salience:
+                self._docs.pop(doc_id, None)
+                removed += 1
+            else:
+                meta["salience"] = round(salience, 4)
+        if removed:
+            self._save_docs()
+        return removed
+
     def count(self) -> int:
         return len(self._docs)
 

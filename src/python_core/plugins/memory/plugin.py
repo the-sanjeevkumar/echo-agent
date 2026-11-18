@@ -25,6 +25,7 @@ from python_core.core.interfaces import KernelContext, ToolSpec
 
 from .consolidator import ConsolidationLoop
 from .curated import CuratedMemoryStore
+from .learning import LearningLoop
 from .profile import _NAME_STOPWORDS, ProfileStore
 from .storage import EpisodicMemory, SemanticMemory, WorkingMemory
 
@@ -93,6 +94,7 @@ class CognitiveMemoryPlugin:
         self.sm: SemanticMemory | None = None
         self.profiles: ProfileStore | None = None
         self.curated: CuratedMemoryStore | None = None
+        self.learning: LearningLoop | None = None
         self.consolidator: ConsolidationLoop | None = None
         self._ctx: KernelContext | None = None
         self._bus: EventBus | None = None
@@ -119,6 +121,11 @@ class CognitiveMemoryPlugin:
         ctx.services["memory"] = self
         ctx.services["profile_store"] = self.profiles
         ctx.services["curated_memory"] = self.curated
+
+        # PHASE 4: post-turn review / skill synthesis / self-healing proposals.
+        self.learning = LearningLoop(ctx.bus, ctx.config, lambda: ctx.services)
+        ctx.services["learning"] = self.learning
+        self.learning.start()
 
         self.consolidator = ConsolidationLoop(
             ctx.bus, self.wm, self.em, self.sm,
@@ -227,6 +234,8 @@ class CognitiveMemoryPlugin:
         ctx.logger.info("memory plugin online: %s", json.dumps(self.stats()))
 
     async def stop(self) -> None:
+        if self.learning is not None:
+            await self.learning.stop()
         if self.consolidator is not None:
             await self.consolidator.stop()
         for sub in self._subs:

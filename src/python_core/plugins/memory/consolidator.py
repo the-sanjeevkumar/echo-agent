@@ -156,14 +156,25 @@ class ConsolidationLoop:
             patterns = self._extract_heuristic(wm_items, recent_episodes)
 
         # 3. Consolidate into Semantic Memory (durable abstractions).
+        # Phase 4: decay stale patterns, dedup (normalized text + cosine>=0.90)
+        # by merging into the existing doc instead of growing docs.jsonl.
+        evicted = self.sm.decay_patterns()
+        merged = 0
+        written = 0
         for p in patterns:
-            doc_id = f"pattern:{uuid.uuid4().hex[:12]}"
-            self.sm.upsert(
-                doc_id,
-                p["summary"],
-                metadata={"kind": p.get("kind", "fact"), "origin": "consolidation", "ts": time.time()},
-                salience=float(p.get("salience", 0.5)),
-            )
+            existing = self.sm.find_similar(p["summary"], threshold=0.90)
+            if existing is not None:
+                self.sm.reinforce(existing["id"], float(p.get("salience", 0.5)))
+                merged += 1
+            else:
+                doc_id = f"pattern:{uuid.uuid4().hex[:12]}"
+                self.sm.upsert(
+                    doc_id,
+                    p["summary"],
+                    metadata={"kind": p.get("kind", "fact"), "origin": "consolidation", "ts": time.time()},
+                    salience=float(p.get("salience", 0.5)),
+                )
+                written += 1
             # 4. Cause-effect edges also go to the episodic graph.
             if p.get("kind") == "cause-effect":
                 self.em.append(f"[pattern] {p['summary'][:200]}", "consolidated", salience=0.7)
@@ -172,6 +183,9 @@ class ConsolidationLoop:
         self.patterns_written += len(patterns)
         report = {
             "patterns": len(patterns),
+            "merged": merged,
+            "written": written,
+            "evicted": evicted,
             "wm_items_reviewed": len(wm_items),
             "episodes_reviewed": len(recent_episodes),
             "elapsed_ms": int((time.time() - started) * 1000),

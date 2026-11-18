@@ -26,6 +26,7 @@ from python_core.core.plugin_manager import PluginManager
 from python_core.core.tool_registry import ToolRegistry
 from python_core.inter_agent.universal_client import UniversalClientPlugin
 from python_core.orchestrator import Orchestrator
+from python_core.plugins.memory.learning import REVIEW_SCHEMA
 from python_core.plugins.memory.plugin import (
     EXTRACTION_SCHEMA,
     CognitiveMemoryPlugin,
@@ -53,8 +54,11 @@ class FakeProvider:
     def __init__(self, script: list[dict[str, Any]] | None = None) -> None:
         self.script = list(script or [])
         self.calls: list[list[dict[str, str]]] = []
-        # Optional override returned for profile-extraction probes.
+        # Optional overrides for the structured probes (Phase 1/4). They never
+        # consume the action script or pollute the action call log.
         self.extraction_return: dict[str, Any] | None = None
+        self.review_return: dict[str, Any] | None = None
+        self.review_calls: list[list[dict[str, str]]] = []
 
     async def complete(
         self,
@@ -69,6 +73,13 @@ class FakeProvider:
                 "content": dict(self.extraction_return)
                 if self.extraction_return is not None
                 else {"name": None, "preferences": [], "facts": []}
+            }
+        if schema is REVIEW_SCHEMA:
+            self.review_calls.append([dict(m) for m in messages])
+            return {
+                "content": dict(self.review_return)
+                if self.review_return is not None
+                else {"facts": [], "preferences": [], "lessons": [], "skill_candidates": []}
             }
         self.calls.append([dict(m) for m in messages])
         action = self.script.pop(0) if self.script else {"thought": "done", "action": "respond", "response": "ok"}
