@@ -24,9 +24,15 @@ features can be deleted, replaced, or hot-swapped without touching the kernel.
   imports remote agents as local tools.
 - **Gateways**: Telegram (plain `httpx` long polling) and Discord (`discord.py`),
   with OpenClaw-style access control, pairing, mention gating, per-chat sessions,
-  chunking, reply threading, and reconnect/backoff.
+  chunking, reply threading, reconnect/backoff, **emoji reactions** (👀 received /
+  ✅ done / ❌ failed), live `/model` switching, and `/new` as a `/reset` alias.
+- **Info commands without pairing**: `/model`, `/status`, `/whoami`, `/help`,
+  `/reset`, `/new` work in DMs even before pairing approval.
 - **CLI**: compact/animated output, `pairing`, `channels`/`gateway`, daemon
   start/stop/restart/status.
+- **Filesystem sandbox**: `fs_allowed_roots` in config controls which directories
+  the agent may read/write (default: project root, data dir, cwd, system temp;
+  set `["/"]` for full access).
 
 ---
 
@@ -122,6 +128,9 @@ typing = true
 pairing_ttl = 3600                        # seconds
 pairing_max_pending = 3                   # per channel
 
+[fs]
+fs_allowed_roots = []                     # empty ⇒ safe defaults; set ["/"] for full access
+
 [session]
 history_limit = 40                        # messages retained per chat
 max_sessions = 128                        # LRU cap
@@ -159,6 +168,20 @@ Data layout:
 │   └── vectors/         # semantic tier
 └── skills/<name>/       # ingested skill wrappers
 ```
+
+### Security — personal information stays local
+
+Your API keys, bot tokens, and pairing codes live **only** in
+`~/.echo_agent/config.toml` (mode `0600`) and
+`~/.echo_agent/gateways/pairing.json`. Both are listed in `.gitignore` and are
+**never** pushed to GitHub.
+
+- `config.toml` holds `[llm] api_key`, `[discord] token`, `[telegram] token`.
+- `pairing.json` holds pending pairing codes (expire after 1 hour).
+- `.gitignore` covers `.echo_agent/`, `*.sqlite3*`, `*.log`, `.env`.
+
+If you clone this repo on another machine, run `echo-agent setup` to create your
+own local `config.toml` — never copy it from GitHub.
 
 ---
 
@@ -267,16 +290,19 @@ indicators, and per-chat session keys. Platform adapters stay thin.
 - Long polling, `getMe` identity, native command menu, offset persistence,
   reconnect/backoff.
 - DMs default to **pairing**; groups default to an **allowlist**.
-- Commands: `/ask`, `/status`, `/reset`, `/whoami`, `/activation`, `/help`, `/start`.
+- Commands: `/ask`, `/status`, `/reset`, `/new`, `/model`, `/whoami`, `/activation`, `/help`, `/start`.
+  Info commands (`/model`, `/status`, `/whoami`, `/help`, `/reset`, `/new`) work
+  in DMs without pairing.
 - Group behavior: optional sender filtering, @mention gating (or reply to bot, or
   native command), per-topic sessions.
 
 ### Discord (`discord.py`, optional extra)
 
 - Gateway client with message content intent, guild/channel/sender allowlists.
-- Text commands (`!ask`, `!status`, `!reset`, `!whoami`, `!activation`, `!help`)
-  and native slash commands (`/ask`, `/status`, `/reset`, `/whoami`,
-  `/activation`, `/help`).
+- Text commands (`!ask`, `!status`, `!reset`, `!new`, `!model`, `!whoami`, `!activation`, `!help`)
+  and native slash commands (`/ask`, `/status`, `/reset`, `/new`, `/model`, `/whoami`,
+  `/activation`, `/help`). Info commands work in DMs without pairing.
+- Reactions: 👀 = received and working, ✅ = task succeeded, ❌ = task failed.
 - Join introductions, chunking, reply threading, reconnect/backoff.
 
 ### Access control defaults (OpenClaw-style)
