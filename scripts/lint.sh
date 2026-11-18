@@ -23,7 +23,11 @@ uv run ruff check \
     src/python_core/lifecycle.py \
     src/python_core/uninstall.py \
     src/python_core/setup_wizard.py \
-    src/python_core/doctor.py
+    src/python_core/doctor.py \
+    tests/test_lifecycle.py \
+    tests/test_setup_wizard.py \
+    tests/test_doctor.py \
+    tests/test_uninstall.py
 
 printf '== pytest ==\n'
 uv run pytest tests/ -q -p no:cacheprovider

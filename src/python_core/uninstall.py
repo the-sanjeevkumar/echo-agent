@@ -64,7 +64,8 @@ class Uninstaller:
         self.verbose = verbose
         self.metadata = read_install_metadata(self.data_dir)
         self._bin_dir = self._uv_bin_dir()
-        self._commands = self._program_commands()
+        shims_present = any((self._bin_dir / name).exists() for name in SHIM_NAMES)
+        self._commands = self._program_commands() if (self.metadata or shims_present) else []
         self._browser_paths = self._owned_browser_paths()
         self._rc_files = [self.home / name for name in RC_FILES if (self.home / name).is_file()]
         self._tool_envs = self._tool_env_dirs()
