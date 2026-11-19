@@ -1,0 +1,104 @@
+# echo-agent example configuration — NVIDIA Nemotron via OpenAI-compatible API
+#
+# Copy to ~/.echo_agent/config.toml and edit, or pass --config.
+# Secrets: never commit this file with real values; use ECHO_LLM_API_KEY etc.
+
+# ─── LLM (NVIDIA Nemotron, OpenAI-compatible) ──────────────────────────────
+base_url = "https://integrate.api.nvidia.com/v1"   # override with ECHO_LLM_BASE_URL
+model = "nvidia/nemotron-3-ultra-550b-a55b"         # override with ECHO_LLM_MODEL
+api_key = ""                                         # ECHO_LLM_API_KEY (never committed)
+timeout = 120.0
+retries = 3
+
+# ─── single owner, shared across CLI + Telegram + Discord ──────────────────
+owner_user_ids = []   # e.g. ["7974643102"]  (ECHO_OWNER_USER_IDS)
+
+# ─── token budget ──────────────────────────────────────────────────────────
+max_context_tokens = 8192
+cache_similarity_threshold = 0.93
+
+# ─── curated memory write gate (PHASE 2) ───────────────────────────────────
+memory_write_approval = false   # true ⇒ /memory approve <id> required
+
+# ─── embeddings (PHASE 3) ──────────────────────────────────────────────────
+embeddings_backend = "auto"     # auto | hash
+embedding_model_dir = ""        # default: <data_dir>/models/all-MiniLM-L6-v2
+enable_embeddings = true
+
+# ─── learning loop (PHASE 4) ───────────────────────────────────────────────
+learning_enabled = true
+review_debounce_seconds = 30.0
+review_max_chars = 2400
+auto_apply_if_tests_pass = false   # true ⇒ sandbox patches apply without /patch approve
+
+# ─── server ops (PHASE 6) ──────────────────────────────────────────────────
+server_ops_enabled = true
+server_ops_units = ["nginx.service", "postgres.service"]
+server_ops_preapproved_units = []
+server_ops_confirm_ttl = 120.0
+server_ops_health_interval = "every 5m"
+server_ops_disk_threshold = 90.0
+server_ops_ram_threshold = 90.0
+server_ops_alerts_reply_channel = ""   # e.g. "telegram:111222333"
+
+# ─── supervisor (PHASE 7) ──────────────────────────────────────────────────
+supervisor_enabled = true
+supervisor_heartbeat_interval = "every 5m"
+supervisor_digest_schedule = "daily at 9am"
+supervisor_retries = 2
+supervisor_alerts_reply_channel = ""   # e.g. "telegram:111222333"
+
+# ─── gateways ──────────────────────────────────────────────────────────────
+[discord]
+token = ""             # ECHO_DISCORD_TOKEN
+dm_policy = "pairing"
+allow_from = []
+group_policy = "allowlist"
+guilds = []
+channels = []
+group_allow_from = []
+require_mention = true
+allow_bots = false
+command_prefix = "!"
+slash_commands = true
+
+[telegram]
+token = ""             # ECHO_TELEGRAM_TOKEN
+dm_policy = "pairing"
+allow_from = []
+group_policy = "allowlist"
+groups = []
+group_allow_from = []
+require_mention = true
+ignore_other_mentions = true
+link_preview = false
+
+[gateway]
+reply_to_mode = "off"     # off | first | all
+progress = "compact"      # off | compact | verbose — live status edits
+status_debounce = 2.0     # seconds between status-message edits
+typing = true
+pairing_ttl = 3600
+pairing_max_pending = 3
+
+# ─── web ───────────────────────────────────────────────────────────────────
+[web]
+max_chars = 8000
+timeout = 30.0
+rate_limit_per_min = 30
+auto_stealth = true
+allowed_domains = []
+blocked_domains = []
+
+# ─── filesystem sandbox ────────────────────────────────────────────────────
+[fs]
+fs_allowed_roots = []   # empty ⇒ safe defaults (project root, data dir, cwd, /tmp)
+
+# ─── sessions ──────────────────────────────────────────────────────────────
+[session]
+history_limit = 40
+max_sessions = 128
+persistence = true
+
+# ─── misc ──────────────────────────────────────────────────────────────────
+manifest_port = 8790

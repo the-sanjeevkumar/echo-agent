@@ -31,7 +31,8 @@ Usage:
   bash install.sh [--extras all] [--version v0.2.0] [--no-setup]
 
 Options:
-  --extras LIST     uv extras to install (e.g. all, native,discord)
+  --extras LIST     uv extras to install (default: all — fresh installs get
+                    every capability: native, discord, embeddings, scrapling)
   --version REF     branch / tag / commit to install (default: main)
   --no-setup        do not launch the setup wizard after installing
   -h, --help        show this help
@@ -172,7 +173,7 @@ maybe_setup() {
 }
 
 main() {
-    local extras="${ECHO_EXTRAS:-}" ref="${ECHO_VERSION:-}" no_setup=0
+    local extras="${ECHO_EXTRAS:-all}" ref="${ECHO_VERSION:-}" no_setup=0
     local os spec bin data_dir full_bin installed_version
 
     while [ $# -gt 0 ]; do

@@ -6,6 +6,8 @@ that stop the agent from running). Optional integrations degrade to warnings.
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import os
 import shutil
 import socket
@@ -23,6 +25,10 @@ def _line(stream: TextIO, mark: str, label: str, detail: str = "") -> None:
     if detail:
         text += f": {detail}"
     print(text, file=stream, flush=True)
+
+
+def _optional(mod: str) -> bool:
+    return bool(importlib.util.find_spec(mod))
 
 
 def _check_port(host: str, port: int) -> tuple[bool, str]:
@@ -152,6 +158,66 @@ def run_doctor(
     else:
         _line(out, "!", "browser binaries", "not found")
         _line(out, "!", "hint", "optional: uv run scrapling install")
+
+    # 10. installed extras / optional capabilities
+    extras = []
+    if _optional("tiktoken"):
+        extras.append("native(tiktoken)")
+    if _optional("chromadb"):
+        extras.append("native(chromadb)")
+    if _optional("discord"):
+        extras.append("discord")
+    if _optional("onnxruntime") and _optional("tokenizers"):
+        extras.append("embeddings(onnxruntime+tokenizers)")
+    if _optional("scrapling"):
+        extras.append("scrapling")
+    if extras:
+        _line(out, "✓", "extras", ", ".join(extras))
+    else:
+        _line(out, "!", "extras", "none (rerun install.sh --extras all for full capability)")
+
+    # 11. embeddings backend (PHASE 3)
+    embeddings_on = bool(loaded.enable_embeddings)
+    backend = str(loaded.embeddings_backend or "auto")
+    onnx_ok = _optional("onnxruntime") and _optional("tokenizers")
+    model_dir = Path(loaded.embedding_model_dir or loaded.data_dir / "models" / "all-MiniLM-L6-v2")
+    model_ok = (model_dir / "model.onnx").is_file() and (model_dir / "tokenizer.json").is_file()
+    active = "onnx" if (embeddings_on and onnx_ok and model_ok) else "hash (offline fallback)"
+    if embeddings_on and not onnx_ok:
+        _line(out, "!", "embeddings", f"backend={backend} → {active} (onnxruntime/tokenizers not installed)")
+    elif embeddings_on and not model_ok:
+        _line(out, "!", "embeddings", f"backend={backend} → {active} (model files missing in {model_dir})")
+    else:
+        _line(out, "✓", "embeddings", f"backend={backend} → {active}")
+
+    # 12. data-dir health (PHASE 1/2 memory files)
+    memory_dir = loaded.memory_dir
+    profile = memory_dir.parent / "profiles" / "owner.json"
+    user_md = memory_dir / "USER.md"
+    memory_md = memory_dir / "MEMORY.md"
+    files_ok = True
+    if not profile.is_file():
+        _line(out, "!", "profile", f"{profile} not yet created (tell the agent your name!)")
+        files_ok = False
+    if not user_md.is_file():
+        _line(out, "!", "USER.md", f"{user_md} not yet created (first save will write it)")
+    if not memory_md.is_file():
+        _line(out, "!", "MEMORY.md", f"{memory_md} not yet created (first save will write it)")
+    if files_ok:
+        _line(out, "✓", "data dir health", f"profiles + {memory_dir.name} present")
+
+    # 13. registered agents (PHASE 7 supervisor)
+    agents_path = loaded.data_dir / "agents.json"
+    try:
+        agents = json.loads(agents_path.read_text(encoding="utf-8"))
+        if isinstance(agents, dict) and agents:
+            _line(out, "✓", "registered agents", ", ".join(str(k) for k in agents))
+        elif agents_path.is_file():
+            _line(out, "!", "registered agents", "none registered")
+        else:
+            _line(out, "!", "registered agents", "no agents.json yet")
+    except (OSError, ValueError):
+        _line(out, "!", "registered agents", f"{agents_path} unreadable")
 
     if hard_failures:
         print(f"{hard_failures} hard failure(s) — see ✗ lines above", file=out)

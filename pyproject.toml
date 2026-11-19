@@ -43,10 +43,16 @@ discord = ["discord.py>=2.3"]
 # Telegram uses the core httpx dependency (plain Bot API long polling), so the
 # extra is intentionally empty and kept for backwards compatibility.
 telegram = []
+# Local embeddings backend (ONNX all-MiniLM-L6-v2, ~100MB CPU-only — NOT a
+# local LLM; fits comfortably within the 16GB ceiling).
+embeddings = [
+    "onnxruntime>=1.17",     # CPU inference for the embedding encoder
+    "tokenizers>=0.20",      # HuggingFace fast tokenizer
+]
 # Internet access (Scrapling: anti-bot bypass + fast HTML/Markdown extraction):
 scrapling = ["scrapling[fetchers,rag]>=0.5"]
-# Everything:
-all = ["echo-agent[native,discord,telegram,scrapling]"]
+# Everything: fresh installs get native layers, Discord, embeddings and web.
+all = ["echo-agent[native,discord,telegram,embeddings,scrapling]"]
 
 # Dev tooling as a PEP 735 dependency-group: uv syncs the `dev` group by
 # default on every `uv run`/`uv sync`, so test plugins never get pruned.

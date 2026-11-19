@@ -935,12 +935,20 @@ dependencies = [
 all = [
     { name = "chromadb" },
     { name = "discord-py" },
+    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "onnxruntime", version = "1.32.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pybind11" },
     { name = "scrapling", extra = ["fetchers", "rag"] },
     { name = "tiktoken" },
+    { name = "tokenizers" },
 ]
 discord = [
     { name = "discord-py" },
+]
+embeddings = [
+    { name = "onnxruntime", version = "1.23.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "onnxruntime", version = "1.32.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "tokenizers" },
 ]
 native = [
     { name = "chromadb" },
@@ -962,19 +970,21 @@ dev = [
 requires-dist = [
     { name = "chromadb", marker = "extra == 'native'", specifier = ">=0.5" },
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.3" },
-    { name = "echo-agent", extras = ["native", "discord", "telegram", "scrapling"], marker = "extra == 'all'" },
+    { name = "echo-agent", extras = ["native", "discord", "telegram", "embeddings", "scrapling"], marker = "extra == 'all'" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "networkx", specifier = ">=3.2" },
     { name = "numpy", specifier = ">=1.26" },
+    { name = "onnxruntime", marker = "extra == 'embeddings'", specifier = ">=1.17" },
     { name = "pybind11", marker = "extra == 'native'", specifier = ">=2.12" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "scrapling", extras = ["fetchers", "rag"], specifier = ">=0.5" },
     { name = "scrapling", extras = ["fetchers", "rag"], marker = "extra == 'scrapling'", specifier = ">=0.5" },
     { name = "tiktoken", marker = "extra == 'native'", specifier = ">=0.7" },
+    { name = "tokenizers", marker = "extra == 'embeddings'", specifier = ">=0.20" },
     { name = "uvicorn", specifier = ">=0.29" },
 ]
-provides-extras = ["native", "discord", "telegram", "scrapling", "all"]
+provides-extras = ["native", "discord", "telegram", "embeddings", "scrapling", "all"]
 
 [package.metadata.requires-dev]
 dev = [
