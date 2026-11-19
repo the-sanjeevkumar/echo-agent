@@ -333,6 +333,26 @@ class GatewayInterface(ABC):
 
         self._notice_subs.append(bus.subscribe("server:alert", _on_server_alert, label=f"gateway.{self.name}.alert"))
 
+        # Supervisor alerts + daily digest → owner chat (Phase 7).
+        async def _on_supervisor(event: Any) -> None:
+            payload = getattr(event, "payload", event) or {}
+            channel = str(payload.get("reply_channel") or "")
+            if not channel.startswith(prefix):
+                return
+            platform = str(payload.get("platform") or "")
+            if platform and platform != self.name:
+                return
+            text = str(payload.get("text") or "") or (
+                f"🚨 SUPERVISOR: {payload.get('message', 'agent alert')}"
+            )
+            try:
+                await self.send_reply(channel[len(prefix):], text)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("%s supervisor notice failed: %s", self.name, exc)
+
+        self._notice_subs.append(bus.subscribe("supervisor:alert", _on_supervisor, label=f"gateway.{self.name}.supervisor-alert"))
+        self._notice_subs.append(bus.subscribe("supervisor:digest", _on_supervisor, label=f"gateway.{self.name}.supervisor-digest"))
+
         for topic, kind in (
             ("memory:consolidated", "memory"),
             ("skill:synthesized", "skill"),

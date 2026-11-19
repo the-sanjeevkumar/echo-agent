@@ -52,6 +52,7 @@ from python_core.plugins.scheduler import SchedulerPlugin
 from python_core.plugins.self_healing.plugin import SelfHealingPlugin
 from python_core.plugins.server_ops import ServerOpsPlugin
 from python_core.plugins.skills.ingester import SkillIngester
+from python_core.plugins.supervisor import SupervisorPlugin
 from python_core.plugins.web.plugin import WebPlugin
 from python_core.setup_wizard import SetupOptions, run_setup
 from python_core.ui import (
@@ -263,6 +264,7 @@ async def build_kernel(
     pm.register(WebPlugin(config))
     pm.register(SchedulerPlugin(config))
     pm.register(ServerOpsPlugin(config))
+    pm.register(SupervisorPlugin(config))
     from python_core.inter_agent.universal_client import UniversalClientPlugin
 
     pm.register(UniversalClientPlugin(config))
@@ -440,6 +442,7 @@ def _cmd_plugins(config: EchoConfig) -> int:
         {"name": "web", "capabilities": WebPlugin.capabilities},
         {"name": "scheduler", "capabilities": ["cron", "background-tasks"]},
         {"name": "server_ops", "capabilities": ServerOpsPlugin.capabilities},
+        {"name": "supervisor", "capabilities": SupervisorPlugin.capabilities},
         {"name": "universal_client", "capabilities": ["inter-agent-client", "http"]},
         {"name": "orchestrator", "capabilities": ["agent-loop", "structured-output", "sessions"]},
     ]

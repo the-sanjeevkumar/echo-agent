@@ -34,6 +34,7 @@ from python_core.plugins.memory.plugin import (
 from python_core.plugins.self_healing.plugin import SelfHealingPlugin
 from python_core.plugins.server_ops import ServerOpsPlugin
 from python_core.plugins.skills.ingester import SkillIngester
+from python_core.plugins.supervisor import SupervisorPlugin
 
 
 class FakeProvider:
@@ -142,6 +143,7 @@ async def kernel(tmp_path: Path) -> Kernel:
     pm.register(provider)
     pm.register(SelfHealingPlugin(config))
     pm.register(ServerOpsPlugin(config))
+    pm.register(SupervisorPlugin(config))
     pm.register(SkillIngester(config))
     pm.register(UniversalClientPlugin(config))
     pm.register(orchestrator)
