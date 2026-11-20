@@ -559,7 +559,9 @@ class Orchestrator:
             self._notify(on_event, {"type": "thinking", "step": step_idx})
             action = await self._ask(messages)
             if action.get("action") == "respond":
-                response = action.get("response") or action.get("thought") or ""
+                response = await self._render_final(
+                    action.get("response") or action.get("thought") or ""
+                )
                 break
 
             tool_name = str(action.get("tool") or "").strip()
@@ -950,6 +952,62 @@ class Orchestrator:
             "args": data.get("args") if isinstance(data.get("args"), dict) else {},
             "response": response,
         }
+
+    async def _render_final(self, response: Any) -> str:
+        """Turn the model's ``response`` field into a user-facing string.
+
+        The system prompt tells the model to emit only JSON, so the ``response``
+        field can leak raw JSON, a dict/list, or None. Never surface raw JSON or
+        a non-string to the user: rephrase JSON into natural language with one
+        bounded LLM call. Any failure falls back to a plain message so the task
+        loop never breaks.
+        """
+        raw: Any = None
+        if not isinstance(response, str):
+            raw = response
+            response = ""
+        stripped = (response or "").strip()
+
+        # Fast path: plain text that is not JSON → deliver as-is.
+        if stripped and not stripped.startswith(("{", "[")):
+            return stripped
+
+        # JSON-like or non-string: rephrase into a natural-language answer.
+        if stripped:
+            payload = stripped[:1500]
+        elif raw is not None:
+            payload = json.dumps(raw, default=str)[:1500]
+        else:
+            return "⚠ I couldn't process that request. Please try again."
+        try:
+            out = await self.provider.complete(
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Convert the following into a short, natural-language "
+                            "answer for the user. Do not include raw JSON. If it "
+                            "is an error, say so plainly:\n" + payload
+                        ),
+                    }
+                ],
+                schema={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"response": {"type": "string"}},
+                    "required": ["response"],
+                },
+                temperature=0.0,
+                max_tokens=300,
+            )
+            content = out.get("content") if isinstance(out, dict) else None
+            if isinstance(content, dict) and content.get("response"):
+                return str(content["response"]).strip()
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+        except Exception:  # noqa: BLE001 — rephrase is best-effort
+            logger.debug("response rephrase failed", exc_info=True)
+        return "⚠ I couldn't process that request. Please try again."
 
     # ── context assembly & pruning (MODULE 4) ──────────────────────────────
     async def _build_messages(

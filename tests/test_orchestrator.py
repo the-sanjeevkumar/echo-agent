@@ -8,6 +8,7 @@ from python_core.core.config import EchoConfig
 from python_core.core.event_bus import EventBus
 from python_core.core.tool_registry import ToolRegistry
 from python_core.orchestrator import SemanticCache, TokenBudget, _extract_json
+from python_core.plugins.llm.openai_compat import LLMProviderError
 from tests.conftest import FakeProvider
 
 
@@ -176,3 +177,40 @@ async def test_broken_progress_callback_cannot_break_loop(kernel) -> None:
     kernel.provider.script = [{"thought": "t", "action": "respond", "response": "fine"}]
     out = await kernel.orchestrator.handle_task("x", on_event=boom)
     assert out["response"] == "fine"
+
+
+async def test_plain_text_response_passes_through(kernel) -> None:
+    """A normal text answer must reach the user unchanged (no JSON leak)."""
+    kernel.provider.script = [
+        {"thought": "done", "action": "respond", "response": "Hello, Sanjeev!"}
+    ]
+    out = await kernel.orchestrator.handle_task("hi", source="test")
+    assert out["response"] == "Hello, Sanjeev!"
+
+
+async def test_json_response_is_rephrased_not_leaked(kernel) -> None:
+    """The model is told to emit only JSON, so it may leak raw JSON in the
+    ``response`` field. That must be rephrased into natural language, never
+    surfaced as raw JSON to the user."""
+    kernel.provider.script = [
+        {"thought": "done", "action": "respond", "response": '{"status": "ok", "value": 42}'},
+        {"thought": "done", "action": "respond", "response": "The status is ok with value 42."},
+    ]
+    out = await kernel.orchestrator.handle_task("check", source="test")
+    assert out["response"] == "The status is ok with value 42."
+    assert "{" not in out["response"] and "}" not in out["response"]
+
+
+async def test_api_error_is_told_to_user(kernel) -> None:
+    """When the LLM API errors, the user must see a clear error message,
+    not a silent failure or raw internals."""
+
+    class BoomProvider(FakeProvider):
+        async def complete(self, messages, *, schema=None, temperature=0.2, max_tokens=None):
+            raise LLMProviderError("upstream boom", status=500)
+
+    kernel.provider = BoomProvider()
+    kernel.orchestrator.provider = kernel.provider
+    out = await kernel.orchestrator.handle_task("anything", source="test")
+    assert "HTTP 500" in out["response"]
+    assert "upstream boom" in out["response"]
